@@ -79,6 +79,8 @@ pub struct App {
     monitor: bool,
     notices: Vec<Notice>,
     takes: Vec<Take>,
+    /// Recording errors, repeated in the summary on exit.
+    errors: Vec<String>,
     quit: bool,
 }
 
@@ -106,6 +108,7 @@ impl App {
             monitor,
             notices: Vec::new(),
             takes: Vec::new(),
+            errors: Vec::new(),
             quit: false,
         };
         for (severity, text) in startup.notices {
@@ -154,11 +157,11 @@ impl App {
         }
     }
 
-    /// Stops everything, closing any recording in progress. Returns the takes saved this run.
+    /// Stops everything, closing any recording in progress.
+    /// Returns the takes saved and the recording errors that happened during the run.
     pub fn finish(self) -> (Vec<Take>, Vec<String>) {
-        let Self { engine, recorder, mut takes, .. } = self;
+        let Self { engine, recorder, mut takes, mut errors, .. } = self;
         drop(engine); // stop feeding audio first
-        let mut errors = Vec::new();
         for event in recorder.shutdown() {
             match event {
                 RecEvent::Saved(take) => takes.push(take),
@@ -221,7 +224,10 @@ impl App {
                 );
                 self.takes.push(take);
             }
-            RecEvent::Failed(message) => self.notify(Severity::Error, message),
+            RecEvent::Failed(message) => {
+                self.notify(Severity::Error, message.clone());
+                self.errors.push(message);
+            }
         }
     }
 
