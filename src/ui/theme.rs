@@ -29,6 +29,18 @@ pub fn key() -> Style {
     Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
+pub fn accent() -> Style {
+    Style::new().fg(ACCENT)
+}
+
+pub fn warn() -> Style {
+    Style::new().fg(WARN)
+}
+
+pub fn bad() -> Style {
+    Style::new().fg(BAD)
+}
+
 pub fn on() -> Style {
     Style::new().fg(GOOD).add_modifier(Modifier::BOLD)
 }

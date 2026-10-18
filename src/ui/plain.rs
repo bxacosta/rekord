@@ -4,7 +4,7 @@
 //! sent one per line on standard input: `record`, `pause`, `resume`, `stop`,
 //! `enhance`, `denoise`, `mute`, `quit`.
 
-use crate::app::{Action, App, Severity};
+use crate::app::{Action, App, Severity, Snapshot};
 use crate::audio::Connection;
 use crate::dsp::dynamics::gain_to_db;
 use crate::format;
@@ -21,15 +21,14 @@ const POLL: Duration = Duration::from_millis(50);
 pub fn run(app: &mut App, deadline: Option<Instant>) -> Result<()> {
     let commands = read_stdin();
     let mut printed_until = Instant::now() - Duration::from_secs(3600);
-    let mut last_connection = None;
-    let mut last_state = app.recording();
+    let mut last: Option<Snapshot> = None;
     let mut next_report = Instant::now() + REPORT_EVERY;
     let mut peak = 0f32;
 
     loop {
         app.tick();
         for line in commands.try_iter() {
-            match parse_command(&line, app.recording()) {
+            match parse_command(&line, app.snapshot().recording.state) {
                 Ok(Some(action)) => app.apply(action),
                 Ok(None) => {}
                 Err(message) => log(&message),
@@ -41,37 +40,28 @@ pub fn run(app: &mut App, deadline: Option<Instant>) -> Result<()> {
             let prefix = match notice.severity {
                 Severity::Error => "error: ",
                 Severity::Warning => "warning: ",
-                _ => "",
+                Severity::Success => "",
             };
             log(&format!("{prefix}{}", notice.text));
             printed_until = notice.at;
         }
 
-        let connection = app.connection();
-        if last_connection.as_ref() != Some(&connection) {
-            log(&describe(&connection));
-            last_connection = Some(connection);
+        let now = app.snapshot();
+        if last.as_ref().is_none_or(|l| l.connection != now.connection) {
+            log(&describe(&now.connection));
         }
-
-        let state = app.recording();
-        if state != last_state {
-            match state {
-                RecState::Recording if last_state == RecState::Paused => log("Recording resumed"),
-                RecState::Recording => {
-                    log(&format!("Recording to {}", app.recording_file().map(|f| format::path(&f)).unwrap_or_default()))
-                }
-                RecState::Paused => log(&format!("Recording paused at {}", format::duration(app.recording_elapsed()))),
-                RecState::Idle => {}
-            }
-            last_state = state;
+        let previous_state = last.as_ref().map_or(RecState::Idle, |l| l.recording.state);
+        if now.recording.state != previous_state {
+            log(&recording_change(previous_state, &now));
         }
 
         peak = peak.max(app.take_peak());
         if Instant::now() >= next_report {
             next_report = Instant::now() + REPORT_EVERY;
-            log(&report(app, peak));
+            log(&report(&now, peak));
             peak = 0.0;
         }
+        last = Some(now);
 
         if app.should_quit() || shutdown::requested() || deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(());
@@ -115,20 +105,30 @@ fn describe(connection: &Connection) -> String {
     }
 }
 
-fn report(app: &App, peak: f32) -> String {
-    let s = app.settings();
+fn recording_change(previous: RecState, now: &Snapshot) -> String {
+    let rec = &now.recording;
+    match rec.state {
+        RecState::Recording if previous == RecState::Paused => "Recording resumed".into(),
+        RecState::Recording => format!("Recording to {}", rec.file.as_deref().map(format::path).unwrap_or_default()),
+        RecState::Paused => format!("Recording paused at {}", format::duration(rec.elapsed)),
+        RecState::Idle => "Recording stopped".into(),
+    }
+}
+
+fn report(s: &Snapshot, peak: f32) -> String {
     let on_off = |on: bool| if on { "on" } else { "off" };
-    let recording = match app.recording() {
+    let rec = &s.recording;
+    let recording = match rec.state {
         RecState::Idle => "not recording".to_string(),
-        RecState::Recording => format!("REC {}", format::duration(app.recording_elapsed())),
-        RecState::Paused => format!("PAUSED {}", format::duration(app.recording_elapsed())),
+        RecState::Recording => format!("REC {} ({})", format::duration(rec.elapsed), format::bytes(rec.bytes)),
+        RecState::Paused => format!("PAUSED {}", format::duration(rec.elapsed)),
     };
     format!(
         "level {:>4.0} dB · gain {} · enhance {} · denoise {} · {recording}",
         gain_to_db(peak).max(-60.0),
-        format::gain(s.gain_db),
-        on_off(s.enhance),
-        on_off(s.denoise),
+        format::gain(s.settings.gain_db),
+        on_off(s.settings.enhance),
+        on_off(s.settings.denoise),
     )
 }
 

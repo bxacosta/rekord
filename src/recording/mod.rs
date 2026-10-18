@@ -6,8 +6,8 @@
 //!   re-processed later.
 //!
 //! The audio thread never touches the disk: it hands frames to a [`Tap`], and the
-//! writer thread checkpoints the files every second (see [`wav`]), so a crash or a
-//! closed terminal loses at most about one second.
+//! writer thread checkpoints the files twice a second (see [`wav`]), so a crash or a
+//! closed terminal loses at most half a second.
 
 mod recovery;
 mod wav;
@@ -24,8 +24,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use wav::WavWriter;
 
-/// How often files are made consistent on disk (the most a crash can lose).
-const CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
+/// How often files are made consistent on disk: the most audio a crash can lose.
+const CHECKPOINT_EVERY: Duration = Duration::from_millis(500);
 /// How often the OS is forced to physically write the data (protects against power loss).
 const SYNC_EVERY: Duration = Duration::from_secs(5);
 /// WAV files cannot exceed 4 GiB: a long take continues in a new part well before that.

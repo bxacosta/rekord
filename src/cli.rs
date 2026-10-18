@@ -9,7 +9,7 @@ use std::time::Duration;
 /// Options only apply to this run. Changes made inside the app (devices, gain,
 /// effects) are remembered for next time.
 #[derive(Debug, Parser)]
-#[command(name = "rekord", version, about, long_about, max_term_width = 100)]
+#[command(name = "rekord", bin_name = "rekord", version, max_term_width = 100)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,

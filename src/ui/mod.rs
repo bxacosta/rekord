@@ -38,14 +38,15 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, deadline: Option<In
 
     loop {
         app.tick();
-        if matches!(app.connection(), Connection::Live { .. }) {
+        let snapshot = app.snapshot();
+        if matches!(snapshot.connection, Connection::Live { .. }) {
             meter.update(app.take_peak());
         } else {
             meter.reset();
         }
 
         terminal.draw(|frame| {
-            let view = ViewState { app, meter: &meter, blink: view::blink_phase(started) };
+            let view = ViewState { snapshot: &snapshot, meter: &meter, blink: view::blink_phase(started) };
             let panel = view::draw(frame, &view);
             if let Some((_, picker)) = picker.as_mut() {
                 picker.render(frame, panel);
@@ -83,8 +84,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, deadline: Option<In
             Some(keys::Command::Do(action)) => app.apply(action),
             Some(keys::Command::Pick(direction)) => {
                 let current = match direction {
-                    Direction::Input => &app.settings().input,
-                    Direction::Output => &app.settings().output,
+                    Direction::Input => &snapshot.settings.input,
+                    Direction::Output => &snapshot.settings.output,
                 };
                 match Picker::open(&host, direction, current) {
                     Ok(open) => picker = Some((direction, open)),

@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod cli;
+mod console;
 mod dsp;
 mod format;
 mod recording;
@@ -15,11 +16,8 @@ use app::{App, Severity, Startup};
 use audio::{DeviceChoice, Direction, devices};
 use clap::Parser;
 use cli::{Cli, Command};
-use ratatui::crossterm::style::Stylize;
-use recording::Take;
 use settings::{GAIN_RANGE_DB, Settings, SettingsFile};
 use std::io::IsTerminal;
-use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -27,7 +25,7 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{} {e:#}", "error:".red().bold());
+            console::error(format!("{e:#}"));
             ExitCode::FAILURE
         }
     }
@@ -39,7 +37,7 @@ fn run(cli: Cli) -> Result<()> {
     let host = cpal::default_host();
 
     if let Some(Command::Devices) = cli.command {
-        return print_devices(&host, &saved);
+        return console::print_devices(&host, &saved);
     }
 
     let mut notices = Vec::new();
@@ -65,10 +63,7 @@ fn run(cli: Cli) -> Result<()> {
     let (takes, errors) = app.finish();
     shutdown::completed();
 
-    print_summary(&takes, &dir);
-    for error in &errors {
-        eprintln!("{} {error}", "error:".red().bold());
-    }
+    console::print_summary(&takes, &errors, &dir);
     result
 }
 
@@ -107,52 +102,5 @@ fn find_device(host: &cpal::Host, direction: Direction, name: &str) -> Result<De
             let kind = if direction == Direction::Input { "microphone" } else { "output" };
             bail!("No {kind} matches \"{name}\". Run `rekord devices` to see what is connected.")
         }
-    }
-}
-
-fn print_devices(host: &cpal::Host, saved: &Settings) -> Result<()> {
-    for (direction, title, choice) in
-        [(Direction::Input, "Microphones", &saved.input), (Direction::Output, "Outputs", &saved.output)]
-    {
-        println!("{}", title.bold());
-        let default = devices::default_device(host, direction).ok().map(|(_, info)| info.id);
-        let list = devices::list(host, direction)?;
-        if list.is_empty() {
-            println!("  {}", "none connected".dark_grey());
-        }
-        let width = list.iter().map(|d| d.name.chars().count()).max().unwrap_or(0);
-        for device in list {
-            let selected = matches!(choice, DeviceChoice::Device { id, .. } if *id == device.id)
-                || (*choice == DeviceChoice::Default && default.as_ref() == Some(&device.id));
-            let marker = if selected { "●".green().to_string() } else { " ".into() };
-            let mut tags = Vec::new();
-            if selected {
-                tags.push("in use".green().to_string());
-            }
-            if default.as_ref() == Some(&device.id) {
-                tags.push("system default".dark_grey().to_string());
-            }
-            println!("  {marker} {:<width$}   {}", device.name, tags.join(&" · ".dark_grey().to_string()));
-        }
-        println!();
-    }
-    println!("{}", "Choose with `rekord -i <name>` / `-o <name>`, or press i / o inside the app.".dark_grey());
-    Ok(())
-}
-
-fn print_summary(takes: &[Take], dir: &Path) {
-    if takes.is_empty() {
-        return;
-    }
-    let count = takes.len();
-    println!(
-        "{} {count} recording{} in {}",
-        "Saved".green().bold(),
-        if count == 1 { "" } else { "s" },
-        format::path(dir)
-    );
-    for take in takes {
-        let names: Vec<_> = take.files.iter().filter_map(|f| f.file_name()).map(|n| n.to_string_lossy()).collect();
-        println!("  {}  {}", format::duration(take.duration).bold(), names.join(&", ".dark_grey().to_string()));
     }
 }

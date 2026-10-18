@@ -37,6 +37,28 @@ pub struct Notice {
     pub at: Instant,
 }
 
+/// What the front ends display, captured at one instant.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub connection: Connection,
+    pub settings: Settings,
+    pub monitor: bool,
+    pub recording: RecordingStatus,
+    /// The most recent notice, however old.
+    pub notice: Option<Notice>,
+    pub dropouts: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecordingStatus {
+    pub state: RecState,
+    /// Length of the current take, pauses excluded.
+    pub elapsed: Duration,
+    pub bytes: u64,
+    pub file: Option<PathBuf>,
+    pub dir: PathBuf,
+}
+
 /// How the app was configured at startup.
 pub struct Startup {
     pub settings: Settings,
@@ -103,6 +125,9 @@ impl App {
                 s.change_denoise_level(steps);
             }),
             Action::ChangeGain(steps) => self.update(|s| s.change_gain(steps)),
+            Action::ToggleMonitor if self.settings.output == DeviceChoice::Off => {
+                self.notify(Severity::Warning, "Not listening on any output: press o to choose one");
+            }
             Action::ToggleMonitor => {
                 self.monitor = !self.monitor;
                 self.engine.controls().set_monitor(self.monitor);
@@ -147,41 +172,27 @@ impl App {
         self.quit
     }
 
-    pub fn settings(&self) -> &Settings {
-        &self.settings
-    }
-
-    pub fn monitor(&self) -> bool {
-        self.monitor
-    }
-
-    pub fn connection(&self) -> Connection {
-        self.engine.connection()
+    /// A consistent picture of the current state, for display.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            connection: self.engine.connection(),
+            settings: self.settings.clone(),
+            monitor: self.monitor,
+            recording: RecordingStatus {
+                state: self.recorder.state(),
+                elapsed: self.recorder.elapsed(),
+                bytes: self.recorder.bytes(),
+                file: self.recorder.current_file(),
+                dir: self.recorder.dir().to_owned(),
+            },
+            notice: self.notices.last().cloned(),
+            dropouts: self.engine.meters().dropouts(),
+        }
     }
 
     /// Highest output level since the last call (linear).
     pub fn take_peak(&self) -> f32 {
         self.engine.meters().take_peak()
-    }
-
-    pub fn dropouts(&self) -> u32 {
-        self.engine.meters().dropouts()
-    }
-
-    pub fn recording(&self) -> RecState {
-        self.recorder.state()
-    }
-
-    pub fn recording_elapsed(&self) -> Duration {
-        self.recorder.elapsed()
-    }
-
-    pub fn recording_bytes(&self) -> u64 {
-        self.recorder.bytes()
-    }
-
-    pub fn recording_file(&self) -> Option<PathBuf> {
-        self.recorder.current_file()
     }
 
     pub fn recordings_dir(&self) -> &Path {

@@ -87,7 +87,7 @@ impl Picker {
         let widest =
             self.items.iter().map(|i| i.label.chars().count() + i.detail.chars().count() + 10).max().unwrap_or(30);
         let width = (widest as u16 + 4).clamp(40, area.width.saturating_sub(4).max(20));
-        let height = (self.items.len() as u16 + 5).min(area.height);
+        let height = (self.items.len() as u16 + 4).min(area.height);
         let [popup] = Layout::horizontal([Constraint::Length(width)]).flex(Flex::Center).areas(area);
         let [popup] = Layout::vertical([Constraint::Length(height)]).flex(Flex::Center).areas(popup);
 
