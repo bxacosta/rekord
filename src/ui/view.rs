@@ -346,16 +346,16 @@ fn choice_name(choice: &DeviceChoice) -> String {
     }
 }
 
-/// `Dropouts: 3 mic (in recordings), 12 output (only what you hear)`
+/// `Dropouts: 3 mic · 12 output`
 fn dropouts_text(d: Dropouts) -> String {
     let mut parts = Vec::new();
     if d.input > 0 {
-        parts.push(format!("{} mic (in recordings)", d.input));
+        parts.push(format!("{} mic", d.input));
     }
     if d.output > 0 {
-        parts.push(format!("{} output (only what you hear)", d.output));
+        parts.push(format!("{} output", d.output));
     }
-    format!("Dropouts: {}", parts.join(", "))
+    format!("Dropouts: {}", parts.join(" · "))
 }
 
 /// `48 kHz`, `44.1 kHz`
