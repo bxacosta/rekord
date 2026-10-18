@@ -1,36 +1,35 @@
-//! One live connection: microphone stream, processing thread and (optional) monitor stream.
+//! One live microphone connection, with an output that can come and go on its own.
 //!
 //! ```text
-//! input callback ─► ring ─► processing thread ─► ring ─► output callback
-//!                           │ resample to 48 kHz
-//!                           │ VoiceProcessor
-//!                           ├─► recorder tap (processed + original)
-//!                           └─► resample to the output rate
+//! input stream ─► ring ─► processing thread ─► ring ─► output stream (optional)
+//!                         │ resample to 48 kHz
+//!                         │ VoiceProcessor
+//!                         ├─► recorder tap (processed + original)
+//!                         └─► monitor: fade, resample to the output rate
 //! ```
 //!
-//! The device callbacks only move samples; everything else happens on the processing
-//! thread. Dropping a [`Session`] stops the streams and joins the thread.
+//! The output can be attached, replaced or detached while the session runs, so a
+//! headphone that disconnects never interrupts the microphone or a recording.
+//! Dropping a [`Session`] stops its streams and joins the processing thread.
 
 use super::controls::{Controls, Meters};
 use super::devices::{DeviceInfo, Resolved};
+use super::streams::{self, Health};
 use crate::dsp::resample::Resampler;
 use crate::dsp::{FRAME_LEN, Frame, SAMPLE_RATE, VoiceProcessor};
 use crate::recording::Tap;
-use anyhow::{Context as _, Result, bail};
-use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::{Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use anyhow::Result;
+use cpal::Stream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// Most audio allowed to queue up for the monitor before frames are skipped to catch up.
+/// Most audio allowed to queue up for the output before frames are skipped to catch up.
 /// Input and output devices run on separate clocks, so the queue slowly drifts.
 const MAX_MONITOR_QUEUE: Duration = Duration::from_millis(60);
-/// After running dry, the monitor waits for this much audio before playing again.
-/// Absorbs Bluetooth's bursty delivery at the cost of a little latency.
-const MONITOR_PREBUFFER: Duration = Duration::from_millis(20);
-/// The input is considered dead if it delivers nothing for this long.
+/// The microphone is considered dead if it delivers nothing for this long.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Everything a session needs that outlives it.
@@ -48,71 +47,93 @@ pub struct SessionInfo {
     pub output: Option<DeviceInfo>,
 }
 
-pub struct Session {
-    pub info: SessionInfo,
+struct Output {
+    info: DeviceInfo,
     health: Arc<Health>,
+    _stream: Stream,
+}
+
+pub struct Session {
+    input: DeviceInfo,
+    input_rate: u32,
+    /// Microphone and processing failures: both end the session.
+    health: Arc<Health>,
+    output: Option<Output>,
+    monitors: Sender<Option<Monitor>>,
+    meters: Arc<Meters>,
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
-    // Streams stop when dropped; kept last so they stop after the worker is told to.
     _input: Stream,
-    _output: Option<Stream>,
 }
 
 impl Session {
-    pub fn start(input: Resolved, output: Option<Resolved>, ctx: &Context) -> Result<Self> {
-        let health = Arc::new(Health::new());
-
-        let in_config =
-            input.device.default_input_config().with_context(|| format!("Cannot open {}", input.info.name))?;
-        let in_rate = in_config.sample_rate();
-        let (in_tx, in_rx) = rtrb::RingBuffer::<f32>::new(in_rate as usize);
-        let input_stream =
-            build_input(&input.device, in_config.sample_format(), &in_config.config(), in_tx, ctx, &health)
-                .with_context(|| format!("Cannot open {}", input.info.name))?;
-
-        let mut monitor = None;
-        let output_stream = match &output {
-            Some(out) => {
-                let config =
-                    out.device.default_output_config().with_context(|| format!("Cannot open {}", out.info.name))?;
-                let rate = config.sample_rate();
-                let (tx, rx) = rtrb::RingBuffer::<f32>::new(rate as usize);
-                monitor = Some(Monitor::new(tx, rate)?);
-                let stream = build_output(&out.device, config.sample_format(), &config.config(), rx, ctx, &health)
-                    .with_context(|| format!("Cannot open {}", out.info.name))?;
-                Some(stream)
-            }
-            None => None,
-        };
-
+    /// Starts listening to `input`, without output.
+    pub fn start(input: Resolved, ctx: &Context) -> Result<Self> {
+        let health = Health::new();
+        let opened = streams::open_input(&input.device, &input.info.name, &ctx.meters, &health)?;
+        let (monitors, monitor_rx) = channel();
         let running = Arc::new(AtomicBool::new(true));
         let worker = {
-            let (ctx, health, running) = (ctx.clone(), health.clone(), running.clone());
+            let (ctx, health, running, rate) = (ctx.clone(), health.clone(), running.clone(), opened.sample_rate);
             thread::Builder::new().name("processing".into()).spawn(move || {
-                if let Err(e) = process(in_rx, in_rate, monitor, &ctx, &running) {
+                if let Err(e) = process(opened.ring, rate, monitor_rx, &ctx, &running) {
                     health.fail(format!("Processing failed: {e:#}"));
                 }
             })?
         };
-
-        input_stream.play()?;
-        if let Some(stream) = &output_stream {
-            stream.play()?;
-        }
-
         Ok(Self {
-            info: SessionInfo { input: input.info, input_rate: in_rate, output: output.map(|o| o.info) },
+            input: input.info,
+            input_rate: opened.sample_rate,
             health,
+            output: None,
+            monitors,
+            meters: ctx.meters.clone(),
             running,
             worker: Some(worker),
-            _input: input_stream,
-            _output: output_stream,
+            _input: opened.stream,
         })
     }
 
-    /// Why this session stopped working, if it did.
-    pub fn problem(&self) -> Option<String> {
-        self.health.problem()
+    pub fn info(&self) -> SessionInfo {
+        SessionInfo {
+            input: self.input.clone(),
+            input_rate: self.input_rate,
+            output: self.output.as_ref().map(|o| o.info.clone()),
+        }
+    }
+
+    pub fn input_id(&self) -> &str {
+        &self.input.id
+    }
+
+    pub fn output_id(&self) -> Option<&str> {
+        self.output.as_ref().map(|o| o.info.id.as_str())
+    }
+
+    /// Plays the processed audio on `output` instead of the current output (if any).
+    /// On failure the session keeps running without output.
+    pub fn set_output(&mut self, output: Option<Resolved>) -> Result<()> {
+        let _ = self.monitors.send(None);
+        self.output = None;
+        let Some(output) = output else { return Ok(()) };
+
+        let health = Health::new();
+        let opened = streams::open_output(&output.device, &output.info.name, &self.meters, &health)?;
+        let _ = self.monitors.send(Some(Monitor::new(opened.ring, opened.sample_rate)?));
+        self.output = Some(Output { info: output.info, health, _stream: opened.stream });
+        Ok(())
+    }
+
+    /// Why the microphone side stopped working, if it did. The session must be restarted.
+    pub fn input_problem(&self) -> Option<String> {
+        self.health.error().or_else(|| {
+            (self.health.silent_for() > INPUT_TIMEOUT).then(|| "The microphone stopped sending audio".into())
+        })
+    }
+
+    /// Why the output stopped working, if it did. Only the output needs replacing.
+    pub fn output_problem(&self) -> Option<String> {
+        self.output.as_ref()?.health.error()
     }
 }
 
@@ -125,162 +146,7 @@ impl Drop for Session {
     }
 }
 
-/// Liveness of a session, reported by the device callbacks.
-struct Health {
-    epoch: Instant,
-    last_input_ms: AtomicU64,
-    error: Mutex<Option<String>>,
-}
-
-impl Health {
-    fn new() -> Self {
-        Self { epoch: Instant::now(), last_input_ms: AtomicU64::new(0), error: Mutex::new(None) }
-    }
-
-    fn now_ms(&self) -> u64 {
-        self.epoch.elapsed().as_millis() as u64
-    }
-
-    fn input_alive(&self) {
-        self.last_input_ms.store(self.now_ms(), Relaxed);
-    }
-
-    fn fail(&self, message: String) {
-        self.error.lock().unwrap().get_or_insert(message);
-    }
-
-    fn problem(&self) -> Option<String> {
-        if let Some(error) = self.error.lock().unwrap().clone() {
-            return Some(error);
-        }
-        let silent_ms = self.now_ms().saturating_sub(self.last_input_ms.load(Relaxed));
-        (silent_ms > INPUT_TIMEOUT.as_millis() as u64).then(|| "The microphone stopped sending audio".into())
-    }
-
-    /// Stream errors: glitches are counted, anything else ends the session.
-    fn stream_error(&self, meters: &Meters, side: &str, error: cpal::Error) {
-        match error.kind() {
-            cpal::ErrorKind::Xrun => meters.record_dropout(),
-            cpal::ErrorKind::RealtimeDenied | cpal::ErrorKind::DeviceChanged => {}
-            _ => self.fail(format!("{side}: {error}")),
-        }
-    }
-}
-
-fn build_input(
-    device: &Device,
-    format: SampleFormat,
-    config: &StreamConfig,
-    ring: rtrb::Producer<f32>,
-    ctx: &Context,
-    health: &Arc<Health>,
-) -> Result<Stream> {
-    match format {
-        SampleFormat::F32 => input_stream::<f32>(device, config, ring, ctx, health),
-        SampleFormat::I16 => input_stream::<i16>(device, config, ring, ctx, health),
-        SampleFormat::I32 => input_stream::<i32>(device, config, ring, ctx, health),
-        SampleFormat::U16 => input_stream::<u16>(device, config, ring, ctx, health),
-        other => bail!("unsupported input sample format {other}"),
-    }
-}
-
-fn input_stream<T>(
-    device: &Device,
-    config: &StreamConfig,
-    mut ring: rtrb::Producer<f32>,
-    ctx: &Context,
-    health: &Arc<Health>,
-) -> Result<Stream>
-where
-    T: SizedSample,
-    f32: FromSample<T>,
-{
-    let channels = config.channels as usize;
-    let (meters, health, err_meters, err_health) =
-        (ctx.meters.clone(), health.clone(), ctx.meters.clone(), health.clone());
-    let mut overflowing = false;
-    let stream = device.build_input_stream(
-        *config,
-        move |data: &[T], _: &cpal::InputCallbackInfo| {
-            health.input_alive();
-            for frame in data.chunks_exact(channels) {
-                let mono = frame.iter().map(|s| f32::from_sample(*s)).sum::<f32>() / channels as f32;
-                // A full ring means processing is stalled: count it once per episode.
-                let lost = ring.push(mono).is_err();
-                if lost && !overflowing {
-                    meters.record_dropout();
-                }
-                overflowing = lost;
-            }
-        },
-        move |e| err_health.stream_error(&err_meters, "Microphone", e),
-        None,
-    )?;
-    Ok(stream)
-}
-
-fn build_output(
-    device: &Device,
-    format: SampleFormat,
-    config: &StreamConfig,
-    ring: rtrb::Consumer<f32>,
-    ctx: &Context,
-    health: &Arc<Health>,
-) -> Result<Stream> {
-    match format {
-        SampleFormat::F32 => output_stream::<f32>(device, config, ring, ctx, health),
-        SampleFormat::I16 => output_stream::<i16>(device, config, ring, ctx, health),
-        SampleFormat::I32 => output_stream::<i32>(device, config, ring, ctx, health),
-        SampleFormat::U16 => output_stream::<u16>(device, config, ring, ctx, health),
-        other => bail!("unsupported output sample format {other}"),
-    }
-}
-
-fn output_stream<T>(
-    device: &Device,
-    config: &StreamConfig,
-    mut ring: rtrb::Consumer<f32>,
-    ctx: &Context,
-    health: &Arc<Health>,
-) -> Result<Stream>
-where
-    T: SizedSample + FromSample<f32>,
-{
-    let channels = config.channels as usize;
-    let prebuffer = samples_in(config.sample_rate, MONITOR_PREBUFFER);
-    let (meters, err_meters, err_health) = (ctx.meters.clone(), ctx.meters.clone(), health.clone());
-    let mut buffering = true;
-    let mut has_played = false;
-    let stream = device.build_output_stream(
-        *config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            if buffering && ring.slots() >= prebuffer {
-                buffering = false;
-                has_played = true;
-            }
-            for frame in data.chunks_exact_mut(channels) {
-                let sample = if buffering {
-                    0.0
-                } else if let Ok(s) = ring.pop() {
-                    s
-                } else {
-                    // Ran dry: play silence until the prebuffer refills.
-                    buffering = true;
-                    if has_played {
-                        meters.record_dropout();
-                    }
-                    0.0
-                };
-                frame.fill(T::from_sample(sample));
-            }
-        },
-        move |e| err_health.stream_error(&err_meters, "Output", e),
-        None,
-    )?;
-    Ok(stream)
-}
-
-/// The monitoring branch of the processing thread.
+/// The output branch of the processing thread.
 struct Monitor {
     ring: rtrb::Producer<f32>,
     resampler: Resampler,
@@ -294,8 +160,8 @@ impl Monitor {
         Ok(Self {
             ring,
             resampler: Resampler::new(SAMPLE_RATE, rate, FRAME_LEN)?,
-            max_queue: samples_in(rate, MAX_MONITOR_QUEUE),
-            volume: 1.0,
+            max_queue: (rate as u128 * MAX_MONITOR_QUEUE.as_millis() / 1000) as usize,
+            volume: 0.0, // fade in
             scratch: Vec::with_capacity(4 * FRAME_LEN),
         })
     }
@@ -323,7 +189,7 @@ impl Monitor {
 fn process(
     mut input: rtrb::Consumer<f32>,
     in_rate: u32,
-    mut monitor: Option<Monitor>,
+    monitors: Receiver<Option<Monitor>>,
     ctx: &Context,
     running: &AtomicBool,
 ) -> Result<()> {
@@ -332,8 +198,12 @@ fn process(
     let chunk_len = upsampler.chunk_len();
     let mut chunk = vec![0.0; chunk_len];
     let mut pending: Vec<f32> = Vec::with_capacity(4 * FRAME_LEN);
+    let mut monitor = None;
 
     while running.load(Relaxed) {
+        if let Some(latest) = monitors.try_iter().last() {
+            monitor = latest;
+        }
         let Ok(read) = input.read_chunk(chunk_len) else {
             thread::sleep(Duration::from_millis(1));
             continue;
@@ -360,8 +230,4 @@ fn process(
         pending.drain(..consumed);
     }
     Ok(())
-}
-
-fn samples_in(rate: u32, duration: Duration) -> usize {
-    (rate as u128 * duration.as_millis() / 1000) as usize
 }

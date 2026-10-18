@@ -4,6 +4,7 @@ mod controls;
 pub mod devices;
 mod engine;
 pub mod session;
+mod streams;
 
 pub use devices::{DeviceChoice, Direction};
 pub use engine::{Connection, Engine};

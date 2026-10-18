@@ -4,7 +4,7 @@
 //! All device work happens on the engine's own thread, so the UI never blocks on it.
 
 use super::controls::{Controls, Meters};
-use super::devices::{self, DeviceChoice, Direction, Resolved};
+use super::devices::{self, DeviceChoice, Direction};
 use super::session::{Context, Session, SessionInfo};
 use crate::dsp::Params;
 use crate::recording::Tap;
@@ -58,6 +58,7 @@ impl Engine {
             input,
             output,
             session: None,
+            output_error: None,
         };
         let worker = thread::Builder::new().name("engine".into()).spawn(move || supervisor.run(rx))?;
         Ok(Self { commands, controls, meters, connection, worker: Some(worker) })
@@ -99,6 +100,8 @@ struct Supervisor {
     input: DeviceChoice,
     output: DeviceChoice,
     session: Option<Session>,
+    /// Why the chosen output could not be used, shown until it works again.
+    output_error: Option<String>,
 }
 
 impl Supervisor {
@@ -113,16 +116,25 @@ impl Supervisor {
                 }
                 Ok(Command::SetOutput(choice)) => {
                     self.output = choice;
+                    self.output_error = None;
                     next_check = Instant::now();
                 }
                 Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
 
-            if let Some(problem) = self.session.as_ref().and_then(Session::problem) {
-                self.session = None;
-                self.set(Connection::Waiting(format!("{problem}. Reconnecting…")));
-                next_check = Instant::now() + RETRY_AFTER;
+            if let Some(session) = &mut self.session {
+                if let Some(problem) = session.input_problem() {
+                    self.session = None;
+                    self.set(Connection::Waiting(format!("{problem}. Reconnecting…")));
+                    next_check = Instant::now() + RETRY_AFTER;
+                } else if let Some(problem) = session.output_problem() {
+                    // Only the output is lost: the microphone and any recording carry on.
+                    let _ = session.set_output(None);
+                    self.output_error = Some(format!("Output lost ({problem}), retrying"));
+                    self.publish_live(Vec::new());
+                    next_check = next_check.min(Instant::now() + RETRY_AFTER);
+                }
             }
             if Instant::now() >= next_check {
                 next_check = Instant::now() + RECHECK_EVERY;
@@ -131,10 +143,12 @@ impl Supervisor {
         }
     }
 
-    /// Makes sure the running session uses the devices that should be in use right now.
+    /// Makes sure the devices in use are the ones that should be in use right now.
     fn reconcile(&mut self, host: &cpal::Host) {
-        let (input, output) = match self.resolve(host) {
-            Ok(devices) => devices,
+        // The input cannot be switched off: treat that as "use the default".
+        let input_choice = if self.input == DeviceChoice::Off { &DeviceChoice::Default } else { &self.input };
+        let input = match devices::resolve(host, Direction::Input, input_choice) {
+            Ok(input) => input.expect("only the output can be off"),
             Err(e) => {
                 self.session = None;
                 return self.set(Connection::Waiting(format!("{e:#} Retrying…")));
@@ -145,51 +159,45 @@ impl Supervisor {
         if let (true, DeviceChoice::Device { name, .. }) = (input.is_fallback, &self.input) {
             warnings.push(format!("{name} is not connected, using the default microphone"));
         }
+        let output = match devices::resolve(host, Direction::Output, &self.output) {
+            Ok(output) => output,
+            Err(e) => {
+                warnings.push(format!("Not listening: {e:#}"));
+                None
+            }
+        };
         let output = output.filter(|out| {
             if let (true, DeviceChoice::Device { name, .. }) = (out.is_fallback, &self.output) {
                 warnings.push(format!("{name} is not connected, using the default output"));
             }
             let clash = devices::same_hardware(&input.info.name, &out.info.name);
             if clash {
-                warnings.push(format!("Not monitoring: {} is the same headset as the microphone", out.info.name));
+                warnings.push(format!("Not listening: {} is the same headset as the microphone", out.info.name));
             }
             !clash
         });
 
-        let unchanged = self.session.as_ref().is_some_and(|s| {
-            s.info.input.id == input.info.id
-                && s.info.output.as_ref().map(|o| &o.id) == output.as_ref().map(|o| &o.info.id)
-        });
-        if unchanged {
-            return self.update_warnings(warnings);
-        }
-
-        self.session = None; // release the old devices before opening new ones
-        self.set(Connection::Connecting);
-        match Session::start(input, output, &self.ctx) {
-            Ok(session) => {
-                self.set(Connection::Live { session: session.info.clone(), warnings });
-                self.session = Some(session);
+        if self.session.as_ref().is_none_or(|s| s.input_id() != input.info.id) {
+            self.session = None; // release the old devices before opening new ones
+            self.set(Connection::Connecting);
+            match Session::start(input, &self.ctx) {
+                Ok(session) => self.session = Some(session),
+                Err(e) => return self.set(Connection::Waiting(format!("{e:#}. Retrying…"))),
             }
-            Err(e) => self.set(Connection::Waiting(format!("{e:#}. Retrying…"))),
         }
+
+        let session = self.session.as_mut().expect("a session is running");
+        let wanted = output.as_ref().map(|o| o.info.id.as_str());
+        if session.output_id() != wanted {
+            self.output_error = session.set_output(output).err().map(|e| format!("Not listening: {e:#}"));
+        }
+        self.publish_live(warnings);
     }
 
-    fn resolve(&self, host: &cpal::Host) -> Result<(Resolved, Option<Resolved>)> {
-        // The input cannot be switched off: treat that as "use the default".
-        let input_choice = match &self.input {
-            DeviceChoice::Off => &DeviceChoice::Default,
-            choice => choice,
-        };
-        let input = devices::resolve(host, Direction::Input, input_choice)?.expect("input is never off");
-        let output = devices::resolve(host, Direction::Output, &self.output)?;
-        Ok((input, output))
-    }
-
-    fn update_warnings(&self, warnings: Vec<String>) {
-        if let Connection::Live { warnings: current, .. } = &mut *self.connection.lock().unwrap() {
-            *current = warnings;
-        }
+    fn publish_live(&self, mut warnings: Vec<String>) {
+        let Some(session) = &self.session else { return };
+        warnings.extend(self.output_error.clone());
+        self.set(Connection::Live { session: session.info(), warnings });
     }
 
     fn set(&self, connection: Connection) {
