@@ -80,8 +80,26 @@ impl Controls {
 pub struct Meters {
     /// Highest processed sample since the UI last looked (linear).
     peak: AtomicF32,
-    /// Audible glitches since start: buffer under/overruns and monitoring gaps.
-    dropouts: AtomicU32,
+    /// Audio glitches since start, by kind.
+    glitches: [AtomicU32; 3],
+}
+
+/// Where audio was lost.
+#[derive(Clone, Copy, Debug)]
+pub enum Glitch {
+    /// Processing fell behind and microphone audio was dropped. Affects recordings.
+    InputOverflow,
+    /// The output driver reported an underrun. Only affects what you hear.
+    OutputXrun,
+    /// Processed audio did not arrive in time for the output. Only affects what you hear.
+    OutputStarved,
+}
+
+/// Glitch totals, split by what they affect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dropouts {
+    pub input: u32,
+    pub output: u32,
 }
 
 impl Meters {
@@ -93,11 +111,18 @@ impl Meters {
         self.peak.take()
     }
 
-    pub fn record_dropout(&self) {
-        self.dropouts.fetch_add(1, Relaxed);
+    pub fn record_glitch(&self, glitch: Glitch) {
+        self.glitches[glitch as usize].fetch_add(1, Relaxed);
     }
 
-    pub fn dropouts(&self) -> u32 {
-        self.dropouts.load(Relaxed)
+    pub fn glitches(&self, glitch: Glitch) -> u32 {
+        self.glitches[glitch as usize].load(Relaxed)
+    }
+
+    pub fn dropouts(&self) -> Dropouts {
+        Dropouts {
+            input: self.glitches(Glitch::InputOverflow),
+            output: self.glitches(Glitch::OutputXrun) + self.glitches(Glitch::OutputStarved),
+        }
     }
 }

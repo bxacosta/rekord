@@ -29,8 +29,11 @@ use std::time::Duration;
 /// Most audio allowed to queue up for the output before frames are skipped to catch up.
 /// Input and output devices run on separate clocks, so the queue slowly drifts.
 const MAX_MONITOR_QUEUE: Duration = Duration::from_millis(60);
-/// The microphone is considered dead if it delivers nothing for this long.
+/// The microphone is considered dead if it stops delivering audio for this long.
 const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a microphone may take to deliver its first audio. Bluetooth headsets need
+/// several seconds to switch to their hands-free profile.
+const INPUT_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Everything a session needs that outlives it.
 #[derive(Clone)]
@@ -127,7 +130,12 @@ impl Session {
     /// Why the microphone side stopped working, if it did. The session must be restarted.
     pub fn input_problem(&self) -> Option<String> {
         self.health.error().or_else(|| {
-            (self.health.silent_for() > INPUT_TIMEOUT).then(|| "The microphone stopped sending audio".into())
+            let (timeout, problem) = if self.health.has_data() {
+                (INPUT_TIMEOUT, "The microphone stopped sending audio")
+            } else {
+                (INPUT_STARTUP_TIMEOUT, "The microphone is not sending any audio")
+            };
+            (self.health.silent_for() > timeout).then(|| problem.into())
         })
     }
 

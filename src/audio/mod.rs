@@ -6,5 +6,6 @@ mod engine;
 pub mod session;
 mod streams;
 
+pub use controls::Dropouts;
 pub use devices::{DeviceChoice, Direction};
 pub use engine::{Connection, Engine};

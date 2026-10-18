@@ -1,6 +1,6 @@
 //! Application state and behavior, shared by the interactive and the plain front ends.
 
-use crate::audio::{Connection, DeviceChoice, Engine};
+use crate::audio::{Connection, DeviceChoice, Dropouts, Engine};
 use crate::recording::{RecEvent, RecState, Recorder, Take};
 use crate::settings::{Settings, SettingsFile};
 use anyhow::Result;
@@ -46,7 +46,7 @@ pub struct Snapshot {
     pub recording: RecordingStatus,
     /// The most recent notice, however old.
     pub notice: Option<Notice>,
-    pub dropouts: u32,
+    pub dropouts: Dropouts,
 }
 
 #[derive(Clone, Debug)]

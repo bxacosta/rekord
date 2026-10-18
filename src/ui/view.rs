@@ -23,7 +23,7 @@
 use super::meter::{self, LevelMeter};
 use super::theme;
 use crate::app::{Severity, Snapshot};
-use crate::audio::{Connection, DeviceChoice};
+use crate::audio::{Connection, DeviceChoice, Dropouts};
 use crate::format;
 use crate::recording::RecState;
 use crate::settings::DENOISE_LEVELS_DB;
@@ -74,14 +74,9 @@ pub fn draw(frame: &mut Frame, view: &ViewState) -> Rect {
             .flex(Flex::Center)
             .areas(column);
 
-    let border = match s.recording.state {
-        RecState::Recording => Style::new().fg(theme::BAD),
-        RecState::Paused => Style::new().fg(theme::WARN),
-        RecState::Idle => theme::border(),
-    };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(border)
+        .border_style(theme::border())
         .title(Line::from(vec![Span::raw(" "), Span::styled("rekord", theme::title()), Span::raw(" ")]))
         .title(connection_badge(&s.connection).right_aligned());
     frame.render_widget(Paragraph::new(lines).block(block), panel_area);
@@ -227,10 +222,7 @@ fn message_line(s: &Snapshot, width: usize) -> Line<'static> {
         (Some(n), _) => ("!", n.text.clone(), theme::WARN),
         (None, Connection::Live { warnings, .. }) if !warnings.is_empty() => ("!", warnings.join(" · "), theme::WARN),
         (None, Connection::Connecting) => ("◌", "Connecting to your devices…".into(), theme::WARN),
-        _ if s.dropouts > 0 => {
-            let plural = if s.dropouts == 1 { "" } else { "s" };
-            ("·", format!("{} audio dropout{plural} so far", s.dropouts), theme::MUTED)
-        }
+        _ if s.dropouts != Dropouts::default() => ("·", dropouts_text(s.dropouts), theme::MUTED),
         _ => ("·", "Ready".into(), theme::MUTED),
     };
     let style = Style::new().fg(color);
@@ -354,6 +346,18 @@ fn choice_name(choice: &DeviceChoice) -> String {
     }
 }
 
+/// `Dropouts: 3 mic (in recordings), 12 output (only what you hear)`
+fn dropouts_text(d: Dropouts) -> String {
+    let mut parts = Vec::new();
+    if d.input > 0 {
+        parts.push(format!("{} mic (in recordings)", d.input));
+    }
+    if d.output > 0 {
+        parts.push(format!("{} output (only what you hear)", d.output));
+    }
+    format!("Dropouts: {}", parts.join(", "))
+}
+
 /// `48 kHz`, `44.1 kHz`
 fn sample_rate(hz: u32) -> String {
     if hz.is_multiple_of(1000) { format!("{} kHz", hz / 1000) } else { format!("{:.1} kHz", hz as f32 / 1000.0) }
@@ -399,7 +403,7 @@ mod tests {
                 severity: Severity::Success,
                 at: Instant::now(),
             }),
-            dropouts: 0,
+            dropouts: Dropouts::default(),
         }
     }
 

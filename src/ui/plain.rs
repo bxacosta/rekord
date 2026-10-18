@@ -124,11 +124,13 @@ fn report(s: &Snapshot, peak: f32) -> String {
         RecState::Paused => format!("PAUSED {}", format::duration(rec.elapsed)),
     };
     format!(
-        "level {:>4.0} dB · gain {} · enhance {} · denoise {} · {recording}",
+        "level {:>4.0} dB · gain {} · enhance {} · denoise {} · dropouts mic {} / output {} · {recording}",
         gain_to_db(peak).max(-60.0),
         format::gain(s.settings.gain_db),
         on_off(s.settings.enhance),
         on_off(s.settings.denoise),
+        s.dropouts.input,
+        s.dropouts.output,
     )
 }
 

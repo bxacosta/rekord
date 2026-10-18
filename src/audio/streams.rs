@@ -1,11 +1,11 @@
 //! Device streams. The callbacks only move samples between the device and a ring
 //! buffer, and report their health; all processing happens elsewhere.
 
-use super::controls::Meters;
+use super::controls::{Glitch, Meters};
 use anyhow::{Context as _, Result, bail};
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,13 +16,19 @@ const OUTPUT_PREBUFFER: Duration = Duration::from_millis(20);
 /// Liveness of one stream, reported from its callbacks.
 pub struct Health {
     epoch: Instant,
+    has_data: AtomicBool,
     last_data_ms: AtomicU64,
     error: Mutex<Option<String>>,
 }
 
 impl Health {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { epoch: Instant::now(), last_data_ms: AtomicU64::new(0), error: Mutex::new(None) })
+        Arc::new(Self {
+            epoch: Instant::now(),
+            has_data: AtomicBool::new(false),
+            last_data_ms: AtomicU64::new(0),
+            error: Mutex::new(None),
+        })
     }
 
     /// Records the first fatal error; later ones are usually consequences of it.
@@ -34,6 +40,11 @@ impl Health {
         self.error.lock().unwrap().clone()
     }
 
+    /// Whether the stream has delivered anything yet.
+    pub fn has_data(&self) -> bool {
+        self.has_data.load(Relaxed)
+    }
+
     /// Time since the stream last delivered data (or since it was created).
     pub fn silent_for(&self) -> Duration {
         let now = self.epoch.elapsed().as_millis() as u64;
@@ -42,12 +53,21 @@ impl Health {
 
     fn alive(&self) {
         self.last_data_ms.store(self.epoch.elapsed().as_millis() as u64, Relaxed);
+        self.has_data.store(true, Relaxed);
     }
 
     /// Glitches are counted; anything else means the stream is dead.
-    fn stream_error(&self, meters: &Meters, device: &str, error: cpal::Error) {
+    ///
+    /// On input, cpal reports Windows' "data discontinuity" flag as an xrun. Bluetooth
+    /// headset drivers raise it many times per second while still delivering every
+    /// sample on time, so it says nothing reliable about lost audio and is ignored.
+    fn stream_error(&self, meters: &Meters, xrun: Option<Glitch>, device: &str, error: cpal::Error) {
         match error.kind() {
-            cpal::ErrorKind::Xrun => meters.record_dropout(),
+            cpal::ErrorKind::Xrun => {
+                if let Some(glitch) = xrun {
+                    meters.record_glitch(glitch);
+                }
+            }
             cpal::ErrorKind::RealtimeDenied | cpal::ErrorKind::DeviceChanged => {}
             _ => self.fail(format!("{device}: {error}")),
         }
@@ -128,12 +148,12 @@ where
                 // A full ring means processing is stalled: count it once per episode.
                 let lost = ring.push(mono).is_err();
                 if lost && !overflowing {
-                    meters.record_dropout();
+                    meters.record_glitch(Glitch::InputOverflow);
                 }
                 overflowing = lost;
             }
         },
-        move |e| err_health.stream_error(&err_meters, &name, e),
+        move |e| err_health.stream_error(&err_meters, None, &name, e),
         None,
     )?;
     Ok(stream)
@@ -164,14 +184,14 @@ where
                     // Ran dry: play silence until the prebuffer refills.
                     buffering = true;
                     if has_played {
-                        meters.record_dropout();
+                        meters.record_glitch(Glitch::OutputStarved);
                     }
                     0.0
                 };
                 frame.fill(T::from_sample(sample));
             }
         },
-        move |e| err_health.stream_error(&err_meters, &name, e),
+        move |e| err_health.stream_error(&err_meters, Some(Glitch::OutputXrun), &name, e),
         None,
     )?;
     Ok(stream)
