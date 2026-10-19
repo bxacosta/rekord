@@ -3,6 +3,7 @@ name = "rekord"
 version = "0.1.0"
 edition = "2024"
 description = "Listen to a microphone live with voice enhancement, and record it without ever losing a take."
+license = "MIT"
 publish = false
 
 [dependencies]
