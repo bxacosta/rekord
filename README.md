@@ -10,6 +10,12 @@ and voice enhancement, and to record it.
 - Reconnects automatically when a device is unplugged or the system default
   changes. Losing the output does not interrupt the recording.
 
+## Install
+
+Download `rekord-<version>-windows-x64.exe` from the
+[releases](../../releases/latest) page. It is a single file with no
+dependencies; rename it to `rekord.exe` and put it in a folder on your `PATH`.
+
 ## Usage
 
 ```sh
@@ -43,3 +49,6 @@ Design notes for anyone changing the code are in
 cargo build --release
 cargo test
 ```
+
+Pushing a tag `vX.Y.Z` that matches the version in `Cargo.toml` builds the
+executable and publishes it as a GitHub release.
