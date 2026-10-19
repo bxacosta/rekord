@@ -189,9 +189,10 @@ Failures:
   Bluetooth headsets take a few seconds to switch to hands-free mode.
 - **Output fails**: only the output is reopened, every 2 seconds, until it
   works. The microphone and the recording keep running.
-- **Microphone and output on the same headset** (for example
-  `Headset (Earphones)` and `Headphones (Earphones)`): monitoring is disabled,
-  because using both forces Bluetooth headsets into low-quality call mode.
+- **Microphone and output on the same Bluetooth headset**: monitoring is
+  disabled. Using a Bluetooth headset's microphone puts it in call mode, where
+  its normal output stops working. USB headsets and built-in audio are not
+  affected.
 
 ## Configuration
 

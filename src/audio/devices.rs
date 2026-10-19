@@ -31,10 +31,20 @@ impl DeviceChoice {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub id: String,
     pub name: String,
+    pub hardware: Hardware,
+}
+
+/// What the system reports about the physical device behind an endpoint.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Hardware {
+    /// Shared by all endpoints of one physical device (Windows' container id).
+    pub container: Option<String>,
+    /// A Bluetooth hands-free endpoint: using it puts the device in call mode.
+    pub hands_free: bool,
 }
 
 impl fmt::Display for DeviceInfo {
@@ -155,22 +165,19 @@ impl Inventory {
     }
 }
 
-/// Whether two endpoints belong to the same physical device. Bluetooth headsets expose
-/// e.g. "Headset (Earphones)" and "Headphones (Earphones)": monitoring through the same
-/// headset whose microphone is in use forces it into low-quality call mode.
-pub fn same_hardware(a: &str, b: &str) -> bool {
-    fn inner(name: &str) -> Option<String> {
-        let (_, rest) = name.split_once('(')?;
-        let (inner, _) = rest.rsplit_once(')')?;
-        Some(inner.trim().to_lowercase())
-    }
-    matches!((inner(a), inner(b)), (Some(x), Some(y)) if x == y)
+/// Whether `output` is on the same Bluetooth device as a hands-free microphone.
+/// A Bluetooth headset whose microphone is in use is in call mode: its stereo
+/// output stops working and only low-quality call audio is available. Other
+/// devices (USB headsets, built-in audio) can use both sides at once.
+pub fn shares_hands_free_device(input: &DeviceInfo, output: &DeviceInfo) -> bool {
+    let (input, output) = (&input.hardware, &output.hardware);
+    input.hands_free && input.container.is_some() && input.container == output.container
 }
 
 fn describe(device: &Device) -> Option<DeviceInfo> {
-    let id = device.id().ok()?.to_string();
+    let id = device.id().ok()?;
     let name = device.description().map(|d| d.name().to_owned()).unwrap_or_else(|_| "Unknown device".into());
-    Some(DeviceInfo { id, name })
+    Some(DeviceInfo { hardware: platform::hardware(&id), id: id.to_string(), name })
 }
 
 #[cfg(windows)]
@@ -180,22 +187,65 @@ mod platform {
     //! initialized in apartment mode (`RPC_E_CHANGED_MODE`). Instead we ask Windows
     //! which endpoint is the default and open that one directly; the engine notices
     //! when the default changes and reconnects.
+    //!
+    //! Hardware details come from standard endpoint properties, available for any
+    //! device: the bus enumerator and the container id.
 
-    use super::Direction;
+    use super::{Direction, Hardware};
     use cpal::Host;
+    use windows::Win32::Foundation::PROPERTYKEY;
     use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eConsole, eRender};
+    use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
     use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, STGM_READ,
     };
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+    use windows::core::{GUID, HSTRING};
+
+    /// `DEVPKEY_Device_EnumeratorName`: the bus the device is attached through.
+    const ENUMERATOR_NAME: PROPERTYKEY =
+        PROPERTYKEY { fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0), pid: 24 };
+    /// `DEVPKEY_Device_ContainerId`: the physical device an endpoint belongs to.
+    const CONTAINER_ID: PROPERTYKEY =
+        PROPERTYKEY { fmtid: GUID::from_u128(0x8c7ed206_3f8a_4827_b3ab_ae9e1faefc6c), pid: 2 };
+    /// Enumerator of classic Bluetooth hands-free (HFP/HSP) audio endpoints.
+    const HANDS_FREE_ENUMERATOR: &str = "BTHHFENUM";
+
+    thread_local! {
+        static ENUMERATOR: Option<IMMDeviceEnumerator> = unsafe {
+            // Same mode cpal uses; harmless if COM is already initialized on this thread.
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()
+        };
+    }
+
+    pub fn hardware(id: &cpal::DeviceId) -> Hardware {
+        ENUMERATOR
+            .with(|e| unsafe {
+                let store = e.as_ref()?.GetDevice(&HSTRING::from(id.id())).ok()?.OpenPropertyStore(STGM_READ).ok()?;
+                let enumerator = read_string(&store, &ENUMERATOR_NAME);
+                Some(Hardware {
+                    container: read_string(&store, &CONTAINER_ID),
+                    hands_free: enumerator.is_some_and(|name| name.eq_ignore_ascii_case(HANDS_FREE_ENUMERATOR)),
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    unsafe fn read_string(store: &IPropertyStore, key: &PROPERTYKEY) -> Option<String> {
+        unsafe {
+            let mut value = store.GetValue(key).ok()?;
+            let text = PropVariantToStringAlloc(&value).ok().and_then(|text| {
+                let owned = text.to_string().ok();
+                CoTaskMemFree(Some(text.0 as *const _));
+                owned
+            });
+            let _ = PropVariantClear(&mut value);
+            text
+        }
+    }
 
     pub fn default_device_id(host: &Host, direction: Direction) -> Option<String> {
-        thread_local! {
-            static ENUMERATOR: Option<IMMDeviceEnumerator> = unsafe {
-                // Same mode cpal uses; harmless if COM is already initialized on this thread.
-                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()
-            };
-        }
         let flow = match direction {
             Direction::Input => eCapture,
             Direction::Output => eRender,
@@ -212,9 +262,13 @@ mod platform {
 
 #[cfg(not(windows))]
 mod platform {
-    use super::Direction;
+    use super::{Direction, Hardware};
     use cpal::Host;
     use cpal::traits::{DeviceTrait, HostTrait};
+
+    pub fn hardware(_id: &cpal::DeviceId) -> Hardware {
+        Hardware::default()
+    }
 
     pub fn default_device_id(host: &Host, direction: Direction) -> Option<String> {
         let device = match direction {
@@ -229,11 +283,19 @@ mod platform {
 mod tests {
     use super::*;
 
+    fn endpoint(container: Option<&str>, hands_free: bool) -> DeviceInfo {
+        DeviceInfo { hardware: Hardware { container: container.map(Into::into), hands_free }, ..Default::default() }
+    }
+
     #[test]
-    fn recognizes_endpoints_of_the_same_headset() {
-        assert!(same_hardware("Headset (Earphones)", "Headphones (earphones)"));
-        assert!(!same_hardware("Microphone (Realtek(R) Audio)", "Speakers (Qudelix-5K)"));
-        assert!(!same_hardware("Microphone", "Speakers"));
+    fn only_a_hands_free_microphone_blocks_its_own_device() {
+        let headset_mic = endpoint(Some("headset"), true);
+        assert!(shares_hands_free_device(&headset_mic, &endpoint(Some("headset"), false)));
+        assert!(!shares_hands_free_device(&headset_mic, &endpoint(Some("speakers"), false)));
+        // A USB headset or built-in audio can record and play at once.
+        assert!(!shares_hands_free_device(&endpoint(Some("usb"), false), &endpoint(Some("usb"), false)));
+        // Without a container id nothing can be concluded.
+        assert!(!shares_hands_free_device(&endpoint(None, true), &endpoint(None, false)));
     }
 
     #[test]

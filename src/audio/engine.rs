@@ -194,7 +194,7 @@ impl Supervisor {
             if let (true, DeviceChoice::Device { name, .. }) = (out.is_fallback, &self.output) {
                 warnings.push(format!("{name} is not connected, using the default output"));
             }
-            let clash = devices::same_hardware(&input.info.name, &out.info.name);
+            let clash = devices::shares_hands_free_device(&input.info, &out.info);
             if clash {
                 warnings.push(format!("Not listening: {} is the same headset as the microphone", out.info.name));
             }

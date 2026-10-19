@@ -383,9 +383,17 @@ mod tests {
         Snapshot {
             connection: Connection::Live {
                 session: SessionInfo {
-                    input: DeviceInfo { id: "in".into(), name: "Microphone (Anker PowerConf C200)".into() },
+                    input: DeviceInfo {
+                        id: "in".into(),
+                        name: "Microphone (Anker PowerConf C200)".into(),
+                        ..Default::default()
+                    },
                     input_rate: 48_000,
-                    output: Some(DeviceInfo { id: "out".into(), name: "Speakers (Qudelix-5K USB DAC 96KHz)".into() }),
+                    output: Some(DeviceInfo {
+                        id: "out".into(),
+                        name: "Speakers (Qudelix-5K USB DAC 96KHz)".into(),
+                        ..Default::default()
+                    }),
                 },
                 warnings: vec![],
             },

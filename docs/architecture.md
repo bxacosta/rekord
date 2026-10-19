@@ -95,10 +95,12 @@ resampler ratio based on the queue level (rubato's `Async` supports it).
   cpal's own default uses `ActivateAudioInterfaceAsync`, which fails with
   `RPC_E_CHANGED_MODE` when COM is initialized in another mode.
 - Devices are stored by id; the name is only for display while disconnected.
-- `same_hardware` compares the text in parentheses (`Headset (Earphones)` vs
-  `Headphones (Earphones)`) to avoid using a headset's mic and output together,
-  which forces call quality. It is a heuristic; comparing
-  `PKEY_Device_ContainerId` would be exact.
+- Monitoring is disabled when the microphone is a Bluetooth hands-free endpoint
+  (enumerator `BTHHFENUM`) and the output has the same container id, i.e. the
+  same physical headset: its microphone puts it in call mode and the stereo
+  output stops working. Sharing a container alone is not enough, since USB
+  headsets and built-in audio can record and play at once. Both values are
+  standard endpoint properties; names are never used.
 
 ## Dropouts
 
