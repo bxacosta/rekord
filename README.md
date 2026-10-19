@@ -1,7 +1,7 @@
 # rekord
 
-Terminal app to monitor a microphone in real time, with optional noise reduction
-and voice enhancement, and to record it.
+Terminal app to monitor and record a microphone in real time, with optional
+noise reduction and voice enhancement.
 
 - Noise reduction with [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet).
 - Voice enhance: EQ and compression to make speech easier to understand.
