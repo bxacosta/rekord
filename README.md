@@ -50,8 +50,7 @@ cargo build --release
 cargo test
 ```
 
-Pushing a tag `vX.Y.Z` that matches the version in `Cargo.toml` builds the
-executable and publishes it as a GitHub release.
+Releases are built by GitHub Actions; see [docs/publishing.md](docs/publishing.md).
 
 ## License
 
