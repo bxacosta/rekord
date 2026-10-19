@@ -3,6 +3,8 @@
 Terminal app to monitor and record a microphone in real time, with optional
 noise reduction and voice enhancement.
 
+![rekord recording with monitoring on](docs/screenshot.png)
+
 - Noise reduction with [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet).
 - Voice enhance: EQ and compression to make speech easier to understand.
 - Recording with pause and resume. Files stay playable if the app is killed,
