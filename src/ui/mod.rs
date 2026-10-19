@@ -8,7 +8,7 @@ pub mod plain;
 mod theme;
 mod view;
 
-use crate::app::{Action, App, Severity};
+use crate::app::{Action, App};
 use crate::audio::{Connection, Direction};
 use crate::shutdown;
 use anyhow::Result;
@@ -31,7 +31,6 @@ pub fn run(app: &mut App, deadline: Option<Instant>) -> Result<()> {
 }
 
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, deadline: Option<Instant>) -> Result<()> {
-    let host = cpal::default_host();
     let started = Instant::now();
     let mut meter = LevelMeter::new();
     let mut picker: Option<(Direction, Picker)> = None;
@@ -87,10 +86,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, deadline: Option<In
                     Direction::Input => &snapshot.settings.input,
                     Direction::Output => &snapshot.settings.output,
                 };
-                match Picker::open(&host, direction, current) {
-                    Ok(open) => picker = Some((direction, open)),
-                    Err(e) => app.notify(Severity::Error, format!("Could not list devices: {e:#}")),
-                }
+                picker = Some((direction, Picker::open(direction, app.devices().get(direction), current)));
             }
             None => {}
         }

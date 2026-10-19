@@ -128,7 +128,9 @@ gain → limiter → noise reduction → voice enhance → limiter
 
 Toggling an effect, changing the gain or muting fades over 10 ms to avoid clicks.
 
-Monitoring adds about 20–60 ms of latency, plus whatever the devices add.
+Monitoring adds about 50–90 ms of latency, plus whatever the devices add. 30 ms
+of it come from noise reduction and apply even when it is off, so turning it on
+or off never makes the audio jump.
 
 ## Recording
 

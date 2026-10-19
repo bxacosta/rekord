@@ -6,9 +6,10 @@
 
 use crate::app::{Action, App, Severity, Snapshot};
 use crate::audio::Connection;
+use crate::console::say;
 use crate::dsp::dynamics::gain_to_db;
 use crate::format;
-use crate::recording::RecState;
+use crate::recording::{Control, RecState};
 use crate::shutdown;
 use anyhow::Result;
 use std::io::BufRead;
@@ -20,7 +21,7 @@ const POLL: Duration = Duration::from_millis(50);
 
 pub fn run(app: &mut App, deadline: Option<Instant>) -> Result<()> {
     let commands = read_stdin();
-    let mut printed_until = Instant::now() - Duration::from_secs(3600);
+    let mut printed_until: Option<Instant> = None;
     let mut last: Option<Snapshot> = None;
     let mut next_report = Instant::now() + REPORT_EVERY;
     let mut peak = 0f32;
@@ -28,7 +29,7 @@ pub fn run(app: &mut App, deadline: Option<Instant>) -> Result<()> {
     loop {
         app.tick();
         for line in commands.try_iter() {
-            match parse_command(&line, app.snapshot().recording.state) {
+            match parse_command(&line) {
                 Ok(Some(action)) => app.apply(action),
                 Ok(None) => {}
                 Err(message) => log(&message),
@@ -36,14 +37,14 @@ pub fn run(app: &mut App, deadline: Option<Instant>) -> Result<()> {
         }
 
         let since = printed_until;
-        for notice in app.notices().iter().filter(|n| n.at > since) {
+        for notice in app.notices().iter().filter(|n| since.is_none_or(|t| n.at > t)) {
             let prefix = match notice.severity {
                 Severity::Error => "error: ",
                 Severity::Warning => "warning: ",
                 Severity::Success => "",
             };
             log(&format!("{prefix}{}", notice.text));
-            printed_until = notice.at;
+            printed_until = Some(notice.at);
         }
 
         let now = app.snapshot();
@@ -70,24 +71,24 @@ pub fn run(app: &mut App, deadline: Option<Instant>) -> Result<()> {
     }
 }
 
-fn parse_command(line: &str, state: RecState) -> Result<Option<Action>, String> {
+fn parse_command(line: &str) -> Result<Option<Action>, String> {
     let action = match line.trim().to_lowercase().as_str() {
         "" => return Ok(None),
-        "record" | "r" => (state == RecState::Idle).then_some(Action::ToggleRecording),
-        "pause" | "p" => (state == RecState::Recording).then_some(Action::ToggleRecording),
-        "resume" => (state == RecState::Paused).then_some(Action::ToggleRecording),
-        "stop" | "s" => Some(Action::StopRecording),
-        "enhance" | "e" => Some(Action::ToggleEnhance),
-        "denoise" | "n" => Some(Action::ToggleDenoise),
-        "mute" | "m" => Some(Action::ToggleMonitor),
-        "quit" | "q" | "exit" => Some(Action::Quit),
+        "record" | "r" => Action::Record(Control::Start),
+        "pause" | "p" => Action::Record(Control::Pause),
+        "resume" => Action::Record(Control::Resume),
+        "stop" | "s" => Action::Record(Control::Stop),
+        "enhance" | "e" => Action::ToggleEnhance,
+        "denoise" | "n" => Action::ToggleDenoise,
+        "mute" | "m" => Action::ToggleMonitor,
+        "quit" | "q" | "exit" => Action::Quit,
         other => {
             return Err(format!(
                 "Unknown command \"{other}\" (record, pause, resume, stop, enhance, denoise, mute, quit)"
             ));
         }
     };
-    Ok(action)
+    Ok(Some(action))
 }
 
 fn describe(connection: &Connection) -> String {
@@ -135,7 +136,7 @@ fn report(s: &Snapshot, peak: f32) -> String {
 }
 
 fn log(message: &str) {
-    println!("[{}] {message}", chrono::Local::now().format("%H:%M:%S"));
+    say!("[{}] {message}", chrono::Local::now().format("%H:%M:%S"));
 }
 
 /// Lines from standard input, read on a background thread. Ends quietly at EOF.
@@ -156,12 +157,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recording_commands_respect_the_current_state() {
-        assert_eq!(parse_command("record", RecState::Idle), Ok(Some(Action::ToggleRecording)));
-        assert_eq!(parse_command("record", RecState::Recording), Ok(None));
-        assert_eq!(parse_command(" Pause ", RecState::Recording), Ok(Some(Action::ToggleRecording)));
-        assert_eq!(parse_command("pause", RecState::Paused), Ok(None));
-        assert_eq!(parse_command("resume", RecState::Paused), Ok(Some(Action::ToggleRecording)));
-        assert!(parse_command("dance", RecState::Idle).is_err());
+    fn parses_commands() {
+        assert_eq!(parse_command("record"), Ok(Some(Action::Record(Control::Start))));
+        assert_eq!(parse_command(" Pause "), Ok(Some(Action::Record(Control::Pause))));
+        assert_eq!(parse_command("resume"), Ok(Some(Action::Record(Control::Resume))));
+        assert_eq!(parse_command(""), Ok(None));
+        assert!(parse_command("dance").is_err());
     }
 }

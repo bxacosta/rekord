@@ -1,6 +1,6 @@
 //! Finding audio devices and turning the user's choice into a concrete device.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Host};
 use serde::{Deserialize, Serialize};
@@ -51,43 +51,108 @@ pub struct Resolved {
     pub is_fallback: bool,
 }
 
-/// Connected devices, in system order.
-pub fn list(host: &Host, direction: Direction) -> Result<Vec<DeviceInfo>> {
-    Ok(devices(host, direction)?.filter_map(|d| describe(&d)).collect())
+/// Connected devices of one direction, without device handles: cheap to share.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceList {
+    /// In system order.
+    pub devices: Vec<DeviceInfo>,
+    pub default: Option<DeviceInfo>,
 }
 
-/// First device whose name contains `query` (case-insensitive).
-pub fn find_by_name(host: &Host, direction: Direction, query: &str) -> Result<Option<DeviceInfo>> {
-    let query = query.to_lowercase();
-    Ok(list(host, direction)?.into_iter().find(|d| d.name.to_lowercase().contains(&query)))
+/// Connected microphones and outputs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceLists {
+    pub inputs: DeviceList,
+    pub outputs: DeviceList,
 }
 
-/// Picks the device to open: the chosen one if connected, otherwise the system default.
-/// Returns `None` when the choice is [`DeviceChoice::Off`].
-pub fn resolve(host: &Host, direction: Direction, choice: &DeviceChoice) -> Result<Option<Resolved>> {
-    let wanted = match choice {
-        DeviceChoice::Off => return Ok(None),
-        DeviceChoice::Default => None,
-        DeviceChoice::Device { id, .. } => Some(id.as_str()),
-    };
-    if let Some(wanted) = wanted
-        && let Some((device, info)) = find(host, direction, |info| info.id == wanted)?
-    {
-        return Ok(Some(Resolved { device, info, is_fallback: false }));
+impl DeviceLists {
+    pub fn get(&self, direction: Direction) -> &DeviceList {
+        match direction {
+            Direction::Input => &self.inputs,
+            Direction::Output => &self.outputs,
+        }
     }
-    let (device, info) = default_device(host, direction)?;
-    Ok(Some(Resolved { device, info, is_fallback: wanted.is_some() }))
 }
 
-/// The system default device, as a concrete device.
-pub fn default_device(host: &Host, direction: Direction) -> Result<(Device, DeviceInfo)> {
-    let kind = match direction {
-        Direction::Input => "microphone",
-        Direction::Output => "output device",
-    };
-    let default =
-        platform::default_device_id(host, direction).with_context(|| format!("There is no default {kind}."))?;
-    find(host, direction, |info| info.id == default)?.with_context(|| format!("The default {kind} is not available."))
+/// The devices connected at one moment, with the handles needed to open them.
+pub struct Inventory {
+    inputs: Scan,
+    outputs: Scan,
+}
+
+struct Scan {
+    devices: Vec<(Device, DeviceInfo)>,
+    default_id: Option<String>,
+}
+
+impl Scan {
+    fn new(host: &Host, direction: Direction) -> Result<Self> {
+        let devices: Box<dyn Iterator<Item = Device>> = match direction {
+            Direction::Input => Box::new(host.input_devices()?),
+            Direction::Output => Box::new(host.output_devices()?),
+        };
+        let devices = devices.filter_map(|device| describe(&device).map(|info| (device, info))).collect();
+        Ok(Self { devices, default_id: platform::default_device_id(host, direction) })
+    }
+
+    fn find(&self, id: &str) -> Option<&(Device, DeviceInfo)> {
+        self.devices.iter().find(|(_, info)| info.id == id)
+    }
+
+    fn default(&self) -> Option<&(Device, DeviceInfo)> {
+        self.find(self.default_id.as_deref()?)
+    }
+}
+
+impl Inventory {
+    pub fn scan(host: &Host) -> Result<Self> {
+        Ok(Self { inputs: Scan::new(host, Direction::Input)?, outputs: Scan::new(host, Direction::Output)? })
+    }
+
+    pub fn lists(&self) -> DeviceLists {
+        let list = |scan: &Scan| DeviceList {
+            devices: scan.devices.iter().map(|(_, info)| info.clone()).collect(),
+            default: scan.default().map(|(_, info)| info.clone()),
+        };
+        DeviceLists { inputs: list(&self.inputs), outputs: list(&self.outputs) }
+    }
+
+    /// First device whose name contains `query` (case-insensitive).
+    pub fn find_by_name(&self, direction: Direction, query: &str) -> Option<&DeviceInfo> {
+        let query = query.to_lowercase();
+        self.get(direction).devices.iter().map(|(_, info)| info).find(|info| info.name.to_lowercase().contains(&query))
+    }
+
+    /// Picks the device to open: the chosen one if connected, otherwise the system default.
+    /// Returns `None` when the choice is [`DeviceChoice::Off`].
+    pub fn resolve(&self, direction: Direction, choice: &DeviceChoice) -> Result<Option<Resolved>> {
+        let scan = self.get(direction);
+        let wanted = match choice {
+            DeviceChoice::Off => return Ok(None),
+            DeviceChoice::Default => None,
+            DeviceChoice::Device { id, .. } => Some(id.as_str()),
+        };
+        if let Some((device, info)) = wanted.and_then(|id| scan.find(id)) {
+            return Ok(Some(Resolved { device: device.clone(), info: info.clone(), is_fallback: false }));
+        }
+        let kind = match direction {
+            Direction::Input => "microphone",
+            Direction::Output => "output device",
+        };
+        if scan.default_id.is_none() {
+            bail!("There is no default {kind}.");
+        }
+        let (device, info) = scan.default().with_context(|| format!("The default {kind} is not available."))?;
+        Ok(Some(Resolved { device: device.clone(), info: info.clone(), is_fallback: wanted.is_some() }))
+    }
+
+    fn get(&self, direction: Direction) -> &Scan {
+        match direction {
+            Direction::Input => &self.inputs,
+            Direction::Output => &self.outputs,
+        }
+    }
 }
 
 /// Whether two endpoints belong to the same physical device. Bluetooth headsets expose
@@ -102,28 +167,10 @@ pub fn same_hardware(a: &str, b: &str) -> bool {
     matches!((inner(a), inner(b)), (Some(x), Some(y)) if x == y)
 }
 
-fn devices(host: &Host, direction: Direction) -> Result<Box<dyn Iterator<Item = Device>>> {
-    Ok(match direction {
-        Direction::Input => Box::new(host.input_devices()?),
-        Direction::Output => Box::new(host.output_devices()?),
-    })
-}
-
 fn describe(device: &Device) -> Option<DeviceInfo> {
     let id = device.id().ok()?.to_string();
     let name = device.description().map(|d| d.name().to_owned()).unwrap_or_else(|_| "Unknown device".into());
     Some(DeviceInfo { id, name })
-}
-
-fn find(
-    host: &Host,
-    direction: Direction,
-    matches: impl Fn(&DeviceInfo) -> bool,
-) -> Result<Option<(Device, DeviceInfo)>> {
-    Ok(devices(host, direction)?.find_map(|device| {
-        let info = describe(&device).filter(&matches)?;
-        Some((device, info))
-    }))
 }
 
 #[cfg(windows)]
@@ -137,7 +184,9 @@ mod platform {
     use super::Direction;
     use cpal::Host;
     use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator, eCapture, eConsole, eRender};
-    use windows::Win32::System::Com::{CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx};
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    };
 
     pub fn default_device_id(host: &Host, direction: Direction) -> Option<String> {
         thread_local! {
@@ -152,7 +201,10 @@ mod platform {
             Direction::Output => eRender,
         };
         let endpoint = ENUMERATOR.with(|e| unsafe {
-            e.as_ref()?.GetDefaultAudioEndpoint(flow, eConsole).ok()?.GetId().ok()?.to_string().ok()
+            let id = e.as_ref()?.GetDefaultAudioEndpoint(flow, eConsole).ok()?.GetId().ok()?;
+            let text = id.to_string().ok();
+            CoTaskMemFree(Some(id.0 as *const _)); // allocated by COM, owned by the caller
+            text
         })?;
         Some(cpal::DeviceId::new(host.id(), endpoint).to_string())
     }

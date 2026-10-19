@@ -2,9 +2,11 @@
 //! and reconnects automatically when a device disappears, comes back or stalls.
 //!
 //! All device work happens on the engine's own thread, so the UI never blocks on it.
+//! The connected devices are published for the UI along with the connection state.
 
 use super::controls::{Controls, Meters};
-use super::devices::{self, DeviceChoice, Direction};
+use super::devices::{self, DeviceChoice, DeviceLists, Direction, Inventory};
+use super::processing::Processing;
 use super::session::{Context, Session, SessionInfo};
 use crate::dsp::Params;
 use crate::recording::Tap;
@@ -43,6 +45,7 @@ pub struct Engine {
     controls: Arc<Controls>,
     meters: Arc<Meters>,
     connection: Arc<Mutex<Connection>>,
+    devices: Arc<Mutex<DeviceLists>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -50,18 +53,22 @@ impl Engine {
     pub fn start(input: DeviceChoice, output: DeviceChoice, params: &Params, monitor: bool, tap: Tap) -> Result<Self> {
         let controls = Arc::new(Controls::new(params, monitor));
         let meters = Arc::new(Meters::default());
+        let processing = Processing::start(controls.clone(), meters.clone(), tap)?;
         let connection = Arc::new(Mutex::new(Connection::Connecting));
+        let devices = Arc::new(Mutex::new(DeviceLists::default()));
         let (commands, rx) = channel();
         let supervisor = Supervisor {
-            ctx: Context { controls: controls.clone(), meters: meters.clone(), tap },
+            ctx: Context { meters: meters.clone(), patcher: processing.patcher() },
             connection: connection.clone(),
+            devices: devices.clone(),
             input,
             output,
             session: None,
             output_error: None,
+            _processing: processing,
         };
         let worker = thread::Builder::new().name("engine".into()).spawn(move || supervisor.run(rx))?;
-        Ok(Self { commands, controls, meters, connection, worker: Some(worker) })
+        Ok(Self { commands, controls, meters, connection, devices, worker: Some(worker) })
     }
 
     pub fn controls(&self) -> &Controls {
@@ -74,6 +81,11 @@ impl Engine {
 
     pub fn connection(&self) -> Connection {
         self.connection.lock().unwrap().clone()
+    }
+
+    /// Connected devices, as of the last check (empty until the first one).
+    pub fn devices(&self) -> DeviceLists {
+        self.devices.lock().unwrap().clone()
     }
 
     pub fn set_input(&self, choice: DeviceChoice) {
@@ -97,11 +109,14 @@ impl Drop for Engine {
 struct Supervisor {
     ctx: Context,
     connection: Arc<Mutex<Connection>>,
+    devices: Arc<Mutex<DeviceLists>>,
     input: DeviceChoice,
     output: DeviceChoice,
     session: Option<Session>,
     /// Why the chosen output could not be used, shown until it works again.
     output_error: Option<String>,
+    /// Declared after `session`, so it stops after the session is dropped.
+    _processing: Processing,
 }
 
 impl Supervisor {
@@ -145,9 +160,18 @@ impl Supervisor {
 
     /// Makes sure the devices in use are the ones that should be in use right now.
     fn reconcile(&mut self, host: &cpal::Host) {
+        let inventory = match Inventory::scan(host) {
+            Ok(inventory) => inventory,
+            Err(e) => {
+                self.session = None;
+                return self.set(Connection::Waiting(format!("Cannot list audio devices: {e:#}. Retrying…")));
+            }
+        };
+        *self.devices.lock().unwrap() = inventory.lists();
+
         // The input cannot be switched off: treat that as "use the default".
         let input_choice = if self.input == DeviceChoice::Off { &DeviceChoice::Default } else { &self.input };
-        let input = match devices::resolve(host, Direction::Input, input_choice) {
+        let input = match inventory.resolve(Direction::Input, input_choice) {
             Ok(input) => input.expect("only the output can be off"),
             Err(e) => {
                 self.session = None;
@@ -159,7 +183,7 @@ impl Supervisor {
         if let (true, DeviceChoice::Device { name, .. }) = (input.is_fallback, &self.input) {
             warnings.push(format!("{name} is not connected, using the default microphone"));
         }
-        let output = match devices::resolve(host, Direction::Output, &self.output) {
+        let output = match inventory.resolve(Direction::Output, &self.output) {
             Ok(output) => output,
             Err(e) => {
                 warnings.push(format!("Not listening: {e:#}"));

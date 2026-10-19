@@ -13,7 +13,8 @@ mod ui;
 
 use anyhow::{Context, Result, bail};
 use app::{App, Severity, Startup};
-use audio::{DeviceChoice, Direction, devices};
+use audio::devices::Inventory;
+use audio::{DeviceChoice, Direction};
 use clap::Parser;
 use cli::{Cli, Command};
 use settings::{GAIN_RANGE_DB, Settings, SettingsFile};
@@ -54,7 +55,8 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     shutdown::install();
-    let deadline = cli.time.map(|t| Instant::now() + t);
+    // A limit too far ahead to represent is the same as no limit.
+    let deadline = cli.time.and_then(|t| Instant::now().checked_add(t));
     let mut app = App::start(Startup { settings, saved, settings_file, recordings_dir, record: cli.record, notices })?;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let result = if interactive { ui::run(&mut app, deadline) } else { ui::plain::run(&mut app, deadline) };
@@ -69,15 +71,18 @@ fn run(cli: Cli) -> Result<()> {
 
 /// Applies one-off command-line options on top of the saved settings.
 fn apply_overrides(cli: &Cli, host: &cpal::Host, mut settings: Settings) -> Result<Settings> {
-    if let Some(name) = &cli.input {
-        settings.input = find_device(host, Direction::Input, name)?;
-    }
-    if let Some(name) = &cli.output {
-        settings.output = if name.eq_ignore_ascii_case("off") {
-            DeviceChoice::Off
-        } else {
-            find_device(host, Direction::Output, name)?
-        };
+    if cli.input.is_some() || cli.output.is_some() {
+        let inventory = Inventory::scan(host)?;
+        if let Some(name) = &cli.input {
+            settings.input = find_device(&inventory, Direction::Input, name)?;
+        }
+        if let Some(name) = &cli.output {
+            settings.output = if name.eq_ignore_ascii_case("off") {
+                DeviceChoice::Off
+            } else {
+                find_device(&inventory, Direction::Output, name)?
+            };
+        }
     }
     if let Some(gain) = cli.gain {
         let (min, max) = GAIN_RANGE_DB;
@@ -95,9 +100,9 @@ fn apply_overrides(cli: &Cli, host: &cpal::Host, mut settings: Settings) -> Resu
     Ok(settings)
 }
 
-fn find_device(host: &cpal::Host, direction: Direction, name: &str) -> Result<DeviceChoice> {
-    match devices::find_by_name(host, direction, name)? {
-        Some(info) => Ok(DeviceChoice::device(&info)),
+fn find_device(inventory: &Inventory, direction: Direction, name: &str) -> Result<DeviceChoice> {
+    match inventory.find_by_name(direction, name) {
+        Some(info) => Ok(DeviceChoice::device(info)),
         None => {
             let kind = if direction == Direction::Input { "microphone" } else { "output" };
             bail!("No {kind} matches \"{name}\". Run `rekord devices` to see what is connected.")

@@ -1,8 +1,8 @@
 //! Pop-up list for choosing the microphone or the output.
 
 use super::theme;
-use crate::audio::{DeviceChoice, Direction, devices};
-use anyhow::Result;
+use crate::audio::devices::DeviceList;
+use crate::audio::{DeviceChoice, Direction};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -30,18 +30,17 @@ pub struct Picker {
 }
 
 impl Picker {
-    pub fn open(host: &cpal::Host, direction: Direction, current: &DeviceChoice) -> Result<Self> {
-        let default_name =
-            devices::default_device(host, direction).map(|(_, info)| info.name).unwrap_or_else(|_| "none".into());
+    pub fn open(direction: Direction, list: &DeviceList, current: &DeviceChoice) -> Self {
+        let default_name = list.default.as_ref().map_or("none", |info| info.name.as_str());
         let mut items = vec![Item {
             label: "System default".into(),
             detail: format!("now {default_name}"),
             choice: DeviceChoice::Default,
         }];
-        items.extend(devices::list(host, direction)?.into_iter().map(|info| Item {
+        items.extend(list.devices.iter().map(|info| Item {
             label: info.name.clone(),
             detail: String::new(),
-            choice: DeviceChoice::device(&info),
+            choice: DeviceChoice::device(info),
         }));
         if direction == Direction::Output {
             items.push(Item {
@@ -54,7 +53,7 @@ impl Picker {
         let current_index = items.iter().position(|item| same_choice(&item.choice, current));
         let mut state = ListState::default();
         state.select(Some(current_index.unwrap_or(0)));
-        Ok(Self { direction, items, current: current_index, state })
+        Self { direction, items, current: current_index, state }
     }
 
     pub fn handle(&mut self, key: KeyEvent) -> Outcome {

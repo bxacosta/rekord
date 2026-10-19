@@ -75,7 +75,8 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
             's' => 1,
             _ => return Err(invalid()),
         };
-        total += number.parse::<u64>().map_err(|_| invalid())? * unit;
+        let value = number.parse::<u64>().map_err(|_| invalid())?;
+        total = value.checked_mul(unit).and_then(|v| total.checked_add(v)).ok_or_else(invalid)?;
         number.clear();
     }
     if !number.is_empty() || total == 0 {
@@ -103,6 +104,7 @@ mod tests {
         assert!(parse_duration("1x").is_err());
         assert!(parse_duration("5m3").is_err());
         assert!(parse_duration("").is_err());
+        assert!(parse_duration("99999999999999999h").is_err());
     }
 
     #[test]

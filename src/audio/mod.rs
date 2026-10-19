@@ -3,6 +3,7 @@
 mod controls;
 pub mod devices;
 mod engine;
+mod processing;
 pub mod session;
 mod streams;
 

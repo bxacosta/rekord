@@ -48,6 +48,19 @@ impl RecState {
     }
 }
 
+/// What the user can ask the recorder to do. Commands are applied on the writer
+/// thread, in order and against the real state, so quick sequences such as a pause
+/// followed by a resume are never misread. Commands that do not apply are ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Control {
+    Start,
+    Pause,
+    Resume,
+    /// Start when idle; otherwise pause or resume.
+    Toggle,
+    Stop,
+}
+
 /// Something the UI should tell the user about.
 #[derive(Debug)]
 pub enum RecEvent {
@@ -63,10 +76,7 @@ pub struct Take {
 }
 
 enum Message {
-    Start,
-    Pause,
-    Resume,
-    Stop,
+    Control(Control),
     Audio(Box<Block>),
     Shutdown,
 }
@@ -136,29 +146,8 @@ impl Recorder {
         self.status.file.lock().unwrap().clone()
     }
 
-    pub fn start(&self) {
-        self.send(Message::Start);
-    }
-
-    pub fn pause(&self) {
-        self.send(Message::Pause);
-    }
-
-    pub fn resume(&self) {
-        self.send(Message::Resume);
-    }
-
-    pub fn stop(&self) {
-        self.send(Message::Stop);
-    }
-
-    /// Start when idle; otherwise pause or resume.
-    pub fn toggle(&self) {
-        match self.state() {
-            RecState::Idle => self.start(),
-            RecState::Recording => self.pause(),
-            RecState::Paused => self.resume(),
-        }
+    pub fn control(&self, control: Control) {
+        self.send(Message::Control(control));
     }
 
     /// Events that happened since the last call.
@@ -229,8 +218,13 @@ impl Part {
         [&mut self.processed, &mut self.original]
     }
 
-    fn finish(self) -> io::Result<Vec<PathBuf>> {
-        Ok(vec![self.processed.finish()?, self.original.finish()?])
+    /// Finalizes both files. Their paths are returned even if that fails: the
+    /// audio is on disk, and the next start repairs the headers.
+    fn finish(self) -> (Vec<PathBuf>, io::Result<()>) {
+        let paths = vec![self.processed.path().to_owned(), self.original.path().to_owned()];
+        let processed = self.processed.finish();
+        let original = self.original.finish();
+        (paths, processed.and(original))
     }
 }
 
@@ -259,10 +253,7 @@ impl Writer {
         loop {
             let timeout = next_checkpoint.saturating_duration_since(Instant::now());
             match rx.recv_timeout(timeout) {
-                Ok(Message::Start) => self.start(),
-                Ok(Message::Pause) => self.pause(),
-                Ok(Message::Resume) => self.resume(),
-                Ok(Message::Stop) => self.stop(),
+                Ok(Message::Control(control)) => self.control(control),
                 Ok(Message::Audio(block)) => self.write(&block),
                 Ok(Message::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
@@ -276,10 +267,18 @@ impl Writer {
         self.stop();
     }
 
-    fn start(&mut self) {
-        if self.take.is_some() {
-            return;
+    fn control(&mut self, control: Control) {
+        let state = RecState::from_u8(self.status.state.load(Relaxed));
+        match (control, state) {
+            (Control::Start | Control::Toggle, RecState::Idle) => self.start(),
+            (Control::Pause | Control::Toggle, RecState::Recording) => self.pause(),
+            (Control::Resume | Control::Toggle, RecState::Paused) => self.resume(),
+            (Control::Stop, _) => self.stop(),
+            _ => {}
         }
+    }
+
+    fn start(&mut self) {
         let stem = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
         match self.open_part(&stem, 1) {
             Ok((part, stem)) => {
@@ -294,17 +293,13 @@ impl Writer {
     }
 
     fn pause(&mut self) {
-        if self.take.is_some() {
-            self.status.set_state(RecState::Paused);
-            // A paused take is fully on disk: nothing is lost if the app is killed now.
-            self.checkpoint(true);
-        }
+        self.status.set_state(RecState::Paused);
+        // A paused take is fully on disk: nothing is lost if the app is killed now.
+        self.checkpoint(true);
     }
 
     fn resume(&mut self) {
-        if self.take.is_some() {
-            self.status.set_state(RecState::Recording);
-        }
+        self.status.set_state(RecState::Recording);
     }
 
     fn stop(&mut self) {
@@ -313,9 +308,10 @@ impl Writer {
         *self.status.file.lock().unwrap() = None;
         let duration = Duration::from_secs_f64(self.status.samples.load(Relaxed) as f64 / SAMPLE_RATE as f64);
         let mut files = take.finished;
-        match take.part.finish() {
-            Ok(paths) => files.extend(paths),
-            Err(e) => self.report(format!("Could not finalize the recording: {e}")),
+        let (paths, result) = take.part.finish();
+        files.extend(paths);
+        if let Err(e) = result {
+            self.report(format!("Could not finalize the recording ({e}); it will be repaired on the next start"));
         }
         let _ = self.events.send(RecEvent::Saved(Take { files, duration }));
     }
@@ -336,9 +332,11 @@ impl Writer {
             let number = take.part_number + 1;
             let next = Self::create_part(&self.dir, &take.stem, number)?;
             let full = std::mem::replace(&mut take.part, next);
-            take.finished.extend(full.finish()?);
+            let (paths, result) = full.finish();
+            take.finished.extend(paths);
             take.part_number = number;
             *self.status.file.lock().unwrap() = Some(take.part.processed.path().to_owned());
+            result?;
         }
         take.part.processed.write(&block.processed)?;
         take.part.original.write(&block.original)?;
@@ -420,16 +418,16 @@ mod tests {
         let tap = recorder.tap();
 
         push_frames(&tap, 10); // not recording yet: ignored
-        recorder.start();
+        recorder.control(Control::Start);
         wait_for(&recorder, RecState::Recording);
         push_frames(&tap, 100);
-        recorder.pause();
+        recorder.control(Control::Pause);
         wait_for(&recorder, RecState::Paused);
         push_frames(&tap, 50); // paused: ignored
-        recorder.resume();
+        recorder.control(Control::Resume);
         wait_for(&recorder, RecState::Recording);
         push_frames(&tap, 100);
-        recorder.stop();
+        recorder.control(Control::Stop);
         wait_for(&recorder, RecState::Idle);
 
         let events = recorder.shutdown();
@@ -443,10 +441,27 @@ mod tests {
     }
 
     #[test]
+    fn commands_sent_in_quick_succession_apply_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Recorder::new(dir.path().to_owned()).unwrap();
+        // Sent without waiting, each must see the state left by the previous one:
+        // start, pause, resume, pause, resume.
+        for control in [Control::Toggle, Control::Toggle, Control::Resume, Control::Pause, Control::Toggle] {
+            recorder.control(control);
+        }
+        recorder.control(Control::Start); // already recording: ignored
+        wait_for(&recorder, RecState::Recording);
+        recorder.control(Control::Toggle);
+        wait_for(&recorder, RecState::Paused);
+        let events = recorder.shutdown();
+        assert!(matches!(events.as_slice(), [RecEvent::Saved(_)]), "{events:?}");
+    }
+
+    #[test]
     fn shutdown_finalizes_a_running_take() {
         let dir = tempfile::tempdir().unwrap();
         let recorder = Recorder::new(dir.path().to_owned()).unwrap();
-        recorder.start();
+        recorder.control(Control::Start);
         wait_for(&recorder, RecState::Recording);
         push_frames(&recorder.tap(), 30);
 
@@ -460,9 +475,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let recorder = Recorder::new(dir.path().to_owned()).unwrap();
         for _ in 0..2 {
-            recorder.start();
+            recorder.control(Control::Start);
             wait_for(&recorder, RecState::Recording);
-            recorder.stop();
+            recorder.control(Control::Stop);
             wait_for(&recorder, RecState::Idle);
         }
         let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
@@ -474,7 +489,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let recorder = Recorder::new(dir.path().join("gone")).unwrap();
         std::fs::remove_dir(dir.path().join("gone")).unwrap();
-        recorder.start();
+        recorder.control(Control::Start);
         let events = recorder.shutdown();
         assert!(matches!(events.as_slice(), [RecEvent::Failed(_)]), "{events:?}");
     }

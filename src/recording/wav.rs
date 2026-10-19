@@ -36,13 +36,11 @@ impl WavWriter {
     }
 
     pub fn write(&mut self, samples: &[f32]) -> io::Result<()> {
-        let mut bytes = Vec::with_capacity(samples.len() * BYTES_PER_SAMPLE as usize);
         for s in samples {
             let value = (s.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
-            bytes.extend_from_slice(&value.to_le_bytes());
+            self.out.write_all(&value.to_le_bytes())?;
+            self.data_bytes += BYTES_PER_SAMPLE;
         }
-        self.out.write_all(&bytes)?;
-        self.data_bytes += bytes.len() as u32;
         Ok(())
     }
 
@@ -61,9 +59,8 @@ impl WavWriter {
     }
 
     /// Writes the final header and closes the file.
-    pub fn finish(mut self) -> io::Result<PathBuf> {
-        self.checkpoint(true)?;
-        Ok(self.path)
+    pub fn finish(mut self) -> io::Result<()> {
+        self.checkpoint(true)
     }
 }
 
@@ -131,7 +128,8 @@ mod tests {
         wav.write(&[0.5; 100]).unwrap();
         wav.checkpoint(false).unwrap();
         assert_eq!(stated_len(wav.path()), 200);
-        let path = wav.finish().unwrap();
+        let path = wav.path().to_owned();
+        wav.finish().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), HEADER_LEN + 200);
     }
 

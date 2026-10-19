@@ -13,6 +13,7 @@ pub struct Denoiser {
     noisy: Array2<f32>,
     clean: Array2<f32>,
     attenuation_db: f32,
+    latency_frames: usize,
 }
 
 impl Denoiser {
@@ -21,7 +22,21 @@ impl Denoiser {
         let params = RuntimeParams::default_with_ch(1).with_atten_lim(attenuation_db);
         let model = DfTract::new(DfParams::default(), &params)?;
         ensure!(model.hop_size == FRAME_LEN, "unexpected denoiser frame size {}", model.hop_size);
-        Ok(Self { model, noisy: Array2::zeros((1, FRAME_LEN)), clean: Array2::zeros((1, FRAME_LEN)), attenuation_db })
+        // STFT overlap plus the model's lookahead, as computed by DeepFilterNet's own tools.
+        let latency = model.fft_size - model.hop_size + model.lookahead * model.hop_size;
+        ensure!(latency % FRAME_LEN == 0, "denoiser latency of {latency} samples is not a whole number of frames");
+        Ok(Self {
+            model,
+            noisy: Array2::zeros((1, FRAME_LEN)),
+            clean: Array2::zeros((1, FRAME_LEN)),
+            attenuation_db,
+            latency_frames: latency / FRAME_LEN,
+        })
+    }
+
+    /// How many frames the output lags behind the input.
+    pub fn latency_frames(&self) -> usize {
+        self.latency_frames
     }
 
     pub fn set_attenuation(&mut self, db: f32) {
@@ -31,7 +46,8 @@ impl Denoiser {
         }
     }
 
-    /// Returns the denoised version of `frame` (borrowed until the next call).
+    /// Returns the denoised version of the frame from [`latency_frames`](Self::latency_frames)
+    /// calls ago (borrowed until the next call).
     pub fn process(&mut self, frame: &Frame) -> Result<&[f32]> {
         self.noisy.row_mut(0).iter_mut().zip(frame).for_each(|(dst, src)| *dst = *src);
         self.model.process(self.noisy.view(), self.clean.view_mut())?;

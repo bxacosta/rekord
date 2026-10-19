@@ -1,7 +1,8 @@
 //! Application state and behavior, shared by the interactive and the plain front ends.
 
+use crate::audio::devices::DeviceLists;
 use crate::audio::{Connection, DeviceChoice, Dropouts, Engine};
-use crate::recording::{RecEvent, RecState, Recorder, Take};
+use crate::recording::{Control, RecEvent, RecState, Recorder, Take};
 use crate::settings::{Settings, SettingsFile};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -10,9 +11,7 @@ use std::time::{Duration, Instant};
 /// Everything the user can ask the app to do.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
-    /// Start a recording, or pause / resume the current one.
-    ToggleRecording,
-    StopRecording,
+    Record(Control),
     ToggleEnhance,
     ToggleDenoise,
     ChangeDenoiseLevel(i32),
@@ -97,7 +96,7 @@ impl App {
             recorder.tap(),
         )?;
         if startup.record {
-            recorder.start();
+            recorder.control(Control::Start);
         }
         let mut app = Self {
             engine,
@@ -119,8 +118,7 @@ impl App {
 
     pub fn apply(&mut self, action: Action) {
         match action {
-            Action::ToggleRecording => self.recorder.toggle(),
-            Action::StopRecording => self.recorder.stop(),
+            Action::Record(control) => self.recorder.control(control),
             Action::ToggleEnhance => self.update(|s| s.enhance = !s.enhance),
             Action::ToggleDenoise => self.update(|s| s.denoise = !s.denoise),
             Action::ChangeDenoiseLevel(steps) => self.update(|s| {
@@ -196,6 +194,11 @@ impl App {
     /// Highest output level since the last call (linear).
     pub fn take_peak(&self) -> f32 {
         self.engine.meters().take_peak()
+    }
+
+    /// Connected devices, as last seen by the engine.
+    pub fn devices(&self) -> DeviceLists {
+        self.engine.devices()
     }
 
     pub fn recordings_dir(&self) -> &Path {

@@ -7,8 +7,13 @@
 | Device callbacks | Move samples to/from a ring buffer | Allocate, lock, process |
 | `processing` | Resample, DSP, feed recorder and output | Touch the disk or wait |
 | `recorder` | Write WAV files | — |
-| `engine` | Open, replace and watch devices | — |
+| `engine` | Open, replace and watch devices; publish the device lists | — |
 | Main | UI loop | Call device APIs (they can block for seconds) |
+
+The processing thread lives as long as the engine. DeepFilterNet's model cannot
+move between threads (it uses `Rc`), takes ~150 ms to load and adapts to the
+room, so it must survive reconnections. Sessions plug their input and output
+rings into it through a `Patcher`.
 
 Threads communicate through `rtrb` rings, `mpsc` channels and atomics, so the
 audio side never blocks. The input ring holds 1 s; it only fills if processing
@@ -42,6 +47,10 @@ gain → limiter → noise reduction → voice enhance → limiter
 - The denoiser runs even when disabled and is crossfaded in or out. It adapts to
   the room over a few seconds, so starting it on demand would sound wrong at
   first.
+- The denoiser output lags 30 ms (STFT overlap plus lookahead). The dry signal it
+  is mixed with and the original sent to the recorder are delayed by the same
+  amount (`FrameDelay`), so toggling it does not jump in time and both files
+  stay aligned. The cost is 30 ms of monitoring latency even when it is off.
 - The enhancer is reset when off: its state adapts in milliseconds.
 - Denoise strength changes are applied without a glide. Add one there if steps
   become audible.
@@ -51,13 +60,16 @@ gain → limiter → noise reduction → voice enhance → limiter
 A `Session` is one microphone plus an optional output.
 
 - Changing or losing the microphone restarts the session. The output is swapped
-  inside the running session (an `Option<Monitor>` sent to the processing
-  thread), so losing headphones never interrupts the microphone or a recording.
+  inside the running session, so losing headphones never interrupts the
+  microphone or a recording.
+- Each stream has its own `Health`. Processing errors are reported to the input's
+  (restarts the session) or the output's (replaces only the output).
 - The `Recorder` belongs to `App`, so a recording continues across session
   restarts.
 - Devices are polled every 2 s (`Supervisor::reconcile`) instead of using
   Windows notifications. One code path covers new defaults, reappearing devices,
-  silent failures and retries.
+  silent failures and retries. Each check scans once (`Inventory`) and publishes
+  the lists, which the device picker reads instead of enumerating itself.
 - A microphone with no data for 3 s is restarted; some drivers stop without an
   error. Before the first data the limit is 15 s, because Bluetooth headsets are
   silent while switching to hands-free mode.
@@ -95,14 +107,17 @@ output starvation after playback started.
 ## Recording
 
 - Only the writer thread changes the recording state; the UI reads it from
-  atomics, so it shows the real state. Commands and audio share one channel, so
-  they stay in order.
+  atomics, so it shows the real state. Commands (`Control`) and audio share one
+  channel, so they stay in order, and each command is checked against the state
+  when it is applied, not when it is sent. `Toggle` is resolved there too.
 - Every 500 ms the WAV header is rewritten with the current length, so the file
   is always playable. `sync_data` runs every 5 s and on pause. Raw PCM finalized
   on exit, RF64 or chunk files were discarded: less compatible or not crash-safe.
 - On startup `wav::repair` fixes headers behind the real length. It only touches
   files whose header matches exactly what `WavWriter` writes, so **changing the
   header format requires changing `repair`**.
+- If finalizing fails, the take still lists its files: the audio is on disk
+  and the next start repairs the headers.
 - Files are created with `create_new` and never overwritten.
 - Parts split at 3.8 GB because WAV sizes are 32-bit.
 
@@ -117,7 +132,8 @@ output starvation after playback started.
 | Panic | `Recorder::drop` finalizes the take |
 
 `App::finish` drops the engine before the recorder, so no audio arrives while
-the take is closed.
+the take is closed. Console output ignores write errors (`console::say!`), so a
+closed pipe does not end a recording.
 
 ## Front ends
 

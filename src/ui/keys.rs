@@ -2,6 +2,7 @@
 
 use crate::app::Action;
 use crate::audio::Direction;
+use crate::recording::Control;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub enum Command {
@@ -14,8 +15,8 @@ pub fn command(key: KeyEvent) -> Option<Command> {
         return matches!(key.code, KeyCode::Char('c')).then_some(Command::Do(Action::Quit));
     }
     let action = match key.code {
-        KeyCode::Char(' ' | 'r' | 'p') => Action::ToggleRecording,
-        KeyCode::Char('s') => Action::StopRecording,
+        KeyCode::Char(' ' | 'r' | 'p') => Action::Record(Control::Toggle),
+        KeyCode::Char('s') => Action::Record(Control::Stop),
         KeyCode::Char('e') => Action::ToggleEnhance,
         KeyCode::Char('n') => Action::ToggleDenoise,
         KeyCode::Char('[') => Action::ChangeDenoiseLevel(-1),
