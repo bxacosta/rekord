@@ -34,6 +34,9 @@ rekord devices         # list microphones and outputs
 Recordings are saved to `Music\Rekord`. See [docs/usage.md](docs/usage.md) for
 all options, the config file and details on recording and devices.
 
+Design notes for anyone changing the code are in
+[docs/architecture.md](docs/architecture.md).
+
 ## Building
 
 ```sh
