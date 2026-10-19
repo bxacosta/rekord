@@ -222,7 +222,9 @@ impl Worker {
                 }
             };
             self.meters.record_peak(out.peak);
-            self.tap.push(&out.audio, &out.original);
+            if !out.is_gap {
+                self.tap.push(&out.audio, &out.original);
+            }
             if let Some(monitor) = self.monitor.as_mut()
                 && let Err(e) = monitor.play(&out.audio, self.controls.monitor())
             {

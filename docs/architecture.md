@@ -44,13 +44,16 @@ gain → limiter → noise reduction → voice enhance → limiter
 
 - Gain goes first because DeepFilterNet removes very quiet signals as
   background, and some microphones (Bluetooth headsets) are very quiet.
-- The denoiser runs even when disabled and is crossfaded in or out. It adapts to
-  the room over a few seconds, so starting it on demand would sound wrong at
-  first.
-- The denoiser output lags 30 ms (STFT overlap plus lookahead). The dry signal it
-  is mixed with and the original sent to the recorder are delayed by the same
-  amount (`FrameDelay`), so toggling it does not jump in time and both files
-  stay aligned. The cost is 30 ms of monitoring latency even when it is off.
+- The denoiser runs even when disabled. It adapts to the room over a few
+  seconds, so starting it on demand would sound wrong at first.
+- Its output lags 30 ms (STFT overlap plus lookahead). Crossfading it with the
+  undelayed signal would repeat or skip audio, and delaying the dry signal would
+  add 30 ms of latency for everyone, although noise reduction is optional. So
+  the output has two paths, direct (off) and denoised (on, 30 ms later), and
+  switching fades out, changes path and fades in. Turning it on plays the 30 ms
+  as silence, marked `is_gap` so it is not recorded; turning it off skips them.
+  The original sent to the recorder follows the same delay, so both files stay
+  aligned.
 - The enhancer is reset when off: its state adapts in milliseconds.
 - Denoise strength changes are applied without a glide. Add one there if steps
   become audible.

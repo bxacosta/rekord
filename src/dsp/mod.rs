@@ -9,10 +9,10 @@
 //! quiet as silence. Every stage change glides over one frame, so toggling
 //! effects or changing the gain never clicks.
 //!
-//! The denoiser output lags its input by a few frames. The dry signal it is mixed
-//! with, and the original returned for recording, are delayed by the same amount,
-//! so the output always has the same latency (30 ms) whether noise reduction is
-//! on or off, and stays aligned with the original.
+//! The denoiser output lags its input by 30 ms. That latency only applies while
+//! noise reduction is on: when it is off the signal bypasses the denoiser (which
+//! keeps running, to stay adapted to the room). Switching fades out, changes the
+//! delay and fades back in; see [`VoiceProcessor::process`].
 
 mod biquad;
 mod delay;
@@ -52,16 +52,23 @@ pub struct Processed {
     pub original: Frame,
     /// Peak level of `audio` (linear, 0..=1).
     pub peak: f32,
+    /// A silent frame that fills the denoiser's latency while noise reduction
+    /// switches on. It must be played but not recorded.
+    pub is_gap: bool,
 }
 
 pub struct VoiceProcessor {
     gain: Ramp,
     input_limiter: Compressor,
     denoiser: Denoiser,
-    /// The signal entering the denoiser, delayed to match its output.
-    dry: FrameDelay,
-    original: FrameDelay,
-    denoise_mix: Ramp,
+    /// Whether the output comes from the denoiser, and so carries its latency.
+    denoising: bool,
+    /// Silent frames left to play while switching noise reduction on.
+    gap: usize,
+    /// Dips to silence while noise reduction switches on or off.
+    level: Ramp,
+    /// The input, delayed to match the denoiser output.
+    delayed_input: FrameDelay,
     enhancer: VoiceEnhancer,
     enhance_mix: Ramp,
     output_limiter: Compressor,
@@ -76,17 +83,24 @@ impl VoiceProcessor {
             gain: Ramp::new(db_to_gain(params.gain_db)),
             input_limiter: Compressor::limiter(rate),
             denoiser,
-            dry: FrameDelay::new(latency),
-            original: FrameDelay::new(latency),
-            denoise_mix: Ramp::new(mix(params.denoise)),
+            denoising: params.denoise,
+            gap: 0,
+            level: Ramp::new(1.0),
+            delayed_input: FrameDelay::new(latency),
             enhancer: VoiceEnhancer::new(rate),
             enhance_mix: Ramp::new(mix(params.enhance)),
             output_limiter: Compressor::limiter(rate),
         })
     }
 
+    /// Processes one frame.
+    ///
+    /// Switching noise reduction changes the output's delay. Turning it on fades
+    /// out, plays the denoiser's latency as silence ([`Processed::is_gap`]) and
+    /// fades in, so no audio is repeated. Turning it off fades out and in,
+    /// skipping the audio still inside the denoiser.
     pub fn process(&mut self, input: &Frame, params: &Params) -> Result<Processed> {
-        let original = self.original.process(input);
+        let delayed_input = self.delayed_input.process(input);
         let mut frame = *input;
         for (sample, gain) in frame.iter_mut().zip(self.gain.glide(db_to_gain(params.gain_db), FRAME_LEN)) {
             *sample = self.input_limiter.process(*sample * gain);
@@ -95,11 +109,29 @@ impl VoiceProcessor {
         // The denoiser always runs so it is already adapted to the room when switched on.
         self.denoiser.set_attenuation(params.denoise_db);
         let clean = self.denoiser.process(&frame)?;
-        frame = self.dry.process(&frame);
-        for ((sample, &clean), wet) in
-            frame.iter_mut().zip(clean).zip(self.denoise_mix.glide(mix(params.denoise), FRAME_LEN))
-        {
-            *sample += (clean - *sample) * wet;
+
+        if self.gap > 0 {
+            // These denoised frames were already played without noise reduction.
+            self.gap -= 1;
+            return Ok(Processed { audio: [0.0; FRAME_LEN], original: [0.0; FRAME_LEN], peak: 0.0, is_gap: true });
+        }
+        let original = if self.denoising {
+            frame.copy_from_slice(clean);
+            delayed_input
+        } else {
+            *input
+        };
+
+        let switching = params.denoise != self.denoising;
+        let level = if switching { 0.0 } else { 1.0 };
+        for (sample, level) in frame.iter_mut().zip(self.level.glide(level, FRAME_LEN)) {
+            *sample *= level;
+        }
+        if switching {
+            self.denoising = params.denoise;
+            if self.denoising {
+                self.gap = self.denoiser.latency_frames();
+            }
         }
 
         let target = mix(params.enhance);
@@ -118,7 +150,7 @@ impl VoiceProcessor {
             *sample = self.output_limiter.process(*sample).clamp(-1.0, 1.0);
             peak = peak.max(sample.abs());
         }
-        Ok(Processed { audio: frame, original, peak })
+        Ok(Processed { audio: frame, original, peak, is_gap: false })
     }
 }
 
@@ -147,15 +179,42 @@ mod tests {
     }
 
     #[test]
-    fn transparent_and_aligned_with_the_original_when_all_effects_are_off() {
+    fn transparent_and_without_delay_when_all_effects_are_off() {
         let mut processor = VoiceProcessor::new(&params()).unwrap();
-        let delay = processor.denoiser.latency_frames();
-        assert!(delay > 0);
         for i in 0..20 {
             let out = processor.process(&tone(i, 0.2), &params()).unwrap();
-            let expected = if i >= delay { tone(i - delay, 0.2) } else { [0.0; FRAME_LEN] };
-            assert!(max_diff(&expected, &out.audio) < 1e-3, "frame {i} differs");
-            assert_eq!(out.original, expected);
+            assert!(max_diff(&tone(i, 0.2), &out.audio) < 1e-3, "frame {i} differs");
+            assert_eq!(out.original, tone(i, 0.2));
+            assert!(!out.is_gap);
+        }
+    }
+
+    #[test]
+    fn switching_noise_reduction_changes_the_delay_without_repeating_audio() {
+        let mut processor = VoiceProcessor::new(&params()).unwrap();
+        let latency = processor.denoiser.latency_frames();
+        let (on_at, off_at) = (10, 30);
+        let (mut gaps, mut recorded, mut previous) = (0, Vec::new(), 0.0);
+        for i in 0..50 {
+            let denoise = (on_at..off_at).contains(&i);
+            let out = processor.process(&tone(i, 0.2), &Params { denoise, ..params() }).unwrap();
+            for &s in &out.audio {
+                assert!((s - previous).abs() < 0.05, "click at frame {i}");
+                previous = s;
+            }
+            if out.is_gap {
+                gaps += 1;
+            } else {
+                recorded.push(out.original);
+            }
+        }
+        assert_eq!(gaps, latency);
+        // The recorded original runs on without repeats; turning off skips the
+        // frames that were still inside the denoiser.
+        let expected: Vec<Frame> = (0..=off_at - latency).chain(off_at + 1..50).map(|i| tone(i, 0.2)).collect();
+        assert_eq!(recorded.len(), expected.len());
+        for (n, (got, want)) in recorded.iter().zip(&expected).enumerate() {
+            assert!(max_diff(got, want) < 1e-6, "recorded frame {n} is out of place");
         }
     }
 

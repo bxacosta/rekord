@@ -119,8 +119,8 @@ gain → limiter → noise reduction → voice enhance → limiter
 - **Noise reduction** uses DeepFilterNet. Its strength is the maximum
   attenuation of noise: 6, 12, 18, 24, 30, 40 dB or `max` (no limit). Lower
   values sound more natural; higher values remove more noise but can affect the
-  voice. The model keeps running while disabled, so turning it on takes effect
-  immediately.
+  voice. The model keeps running while disabled, so it is already adapted to the
+  room when turned on.
 - **Voice enhance** is a fixed EQ (high-pass at 100 Hz, cuts at 300 Hz and
   1 kHz, boost at 3 kHz, high shelf at 5 kHz) followed by a compressor with
   makeup gain.
@@ -128,9 +128,9 @@ gain → limiter → noise reduction → voice enhance → limiter
 
 Toggling an effect, changing the gain or muting fades over 10 ms to avoid clicks.
 
-Monitoring adds about 50–90 ms of latency, plus whatever the devices add. 30 ms
-of it come from noise reduction and apply even when it is off, so turning it on
-or off never makes the audio jump.
+Monitoring adds about 20–60 ms of latency, plus whatever the devices add. Noise
+reduction adds 30 ms while it is on. Turning it on or off causes a short dip in
+the sound; turning it off during a recording skips 30 ms of audio.
 
 ## Recording
 
